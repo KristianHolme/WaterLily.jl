@@ -151,6 +151,9 @@ function residual!(p::Poisson,(u,V,idt)::Tuple)
     @inside p.r[I] = ifelse(p.iD[I]==0,zero(eltype(p.r)),idt*(div(I,u)-δv(p.D,I)*div(I,V))-mult(I,p.L,p.D,reg,p.x))
     fix_residual!(p)
 end
+# The residual and its norms: the norms are reduced in the residual kernels when the source is evaluated on GPUs
+residual_L₁∞!(p::Poisson,src) = (residual!(p,src); L₁∞(p))
+residual_L₁∞!(p::Poisson,src::Tuple) = isgpu(p.x) ? _residual_L₁∞!(p,src) : (residual!(p,src); L₁∞(p))
 function fix_residual!(p::Poisson)
     s = meanr(get_backend(p.r),p.r,p.iD) # only solved rows absorb the imbalance
     abs(s) <= 2eps(eltype(s)) && return
@@ -170,38 +173,70 @@ function increment!(p::Poisson{T};ω=1) where {T}
            p.x[I] = p.x[I]+ω*p.ϵ[I]) over I ∈ inside(p.x)
 end
 """
-    increment_L₁∞!(p::Poisson;ω=1)
+    loop_reduce(f,(op₁,op₂),R,buf,args...)
 
-`increment!(p;ω)` followed by `L₁∞(p)`, with the norms of each workgroup reduced in the
-increment kernel. The partial norms are kept in `p.z`, which is scratch for the multigrid solver.
+GPU loop over `I ∈ R` that runs `f(I,args...)` and reduces the pair of values it returns with
+`op₁` and `op₂`, the starting values being zero. Each workgroup reduces its pairs in shared
+memory and writes them to the scratch array `buf`, which `f` must not use; the partials are then
+reduced in one small `mapreduce`.
 """
-function increment_L₁∞!(p::Poisson{T};ω=1) where {T}
-    perBC!(p.ϵ,p.perdir); R = inside(p.x); n = length(R); ng = cld(n,NORMGROUP)
-    s,m = view(vec(p.z),1:ng),view(vec(p.z),ng+1:2ng)
-    _increment_L₁∞!(get_backend(p.r),NORMGROUP)(p.r,p.x,p.ϵ,p.L,p.D,regs(p),T(ω),s,m,R;ndrange=ng*NORMGROUP)
-    return mapreduce((a,b)->(a,b),((a,b),(c,d))->(a+c,max(b,d)),s,m;init=(zero(T),zero(T)))
+function loop_reduce(f::F,(op₁,op₂),R,buf,args...) where F
+    T = eltype(buf); ng = cld(length(R),NORMGROUP)
+    s,m = view(vec(buf),1:ng),view(vec(buf),ng+1:2ng)
+    _loop_reduce!(get_backend(buf),NORMGROUP)(f,op₁,op₂,s,m,R,args;ndrange=ng*NORMGROUP)
+    return mapreduce((a,b)->(a,b),((a,b),(c,d))->(op₁(a,c),op₂(b,d)),s,m;init=(zero(T),zero(T)))
 end
 const NORMGROUP = 256
-@kernel function _increment_L₁∞!(r,x,ϵ,L,D,reg,ω,s,m,R)
+@kernel function _loop_reduce!(f,op₁,op₂,s,m,R,args)
     i = @index(Global,Linear); t = @index(Local,Linear); g = @index(Group,Linear)
-    a = @localmem eltype(r) (NORMGROUP,); b = @localmem eltype(r) (NORMGROUP,)
-    v = zero(eltype(r))
-    if i ≤ length(R)
-        I = @inbounds R[i]
-        @inbounds v = r[I]-ω*mult(I,L,D,reg,ϵ); @inbounds r[I] = v
-        @inbounds x[I] += ω*ϵ[I]
-    end
-    @inbounds a[t] = abs(v); @inbounds b[t] = abs(v)
+    a = @localmem eltype(s) (NORMGROUP,); b = @localmem eltype(s) (NORMGROUP,)
+    v₁ = v₂ = zero(eltype(s))
+    i ≤ length(R) && ((v₁,v₂) = f(@inbounds(R[i]),args...))
+    @inbounds a[t] = v₁; @inbounds b[t] = v₂
     @synchronize
     k = NORMGROUP÷2
     while k ≥ 1
-        if t ≤ k
-            @inbounds a[t] += a[t+k]; @inbounds b[t] = max(b[t],b[t+k])
-        end
+        t ≤ k && (@inbounds a[t] = op₁(a[t],a[t+k]); @inbounds b[t] = op₂(b[t],b[t+k]))
         @synchronize
         k ÷= 2
     end
     t == 1 && (@inbounds s[g] = a[1]; @inbounds m[g] = b[1])
+end
+
+"""
+    increment_L₁∞!(p::Poisson;ω=1)
+
+`increment!(p;ω)` followed by `L₁∞(p)`, with the norms reduced in the increment kernel (GPUs).
+"""
+function increment_L₁∞!(p::Poisson{T};ω=1) where {T}
+    perBC!(p.ϵ,p.perdir)
+    loop_reduce(_increment,(+,max),inside(p.x),p.z,p.r,p.x,p.ϵ,p.L,p.D,regs(p),T(ω))
+end
+@fastmath @inline function _increment(I,r,x,ϵ,L,D,reg,ω)
+    @inbounds v = r[I]-ω*mult(I,L,D,reg,ϵ); @inbounds r[I] = v
+    @inbounds x[I] += ω*ϵ[I]
+    return abs(v),abs(v)
+end
+
+# `residual!(p,src)` followed by `L₁∞(p)` on GPUs: the residual kernel also sums `r` and counts the
+# solved cells, and the kernel that subtracts the mean also reduces the norms
+function _residual_L₁∞!(p::Poisson{T},(u,V,idt)::Tuple) where {T}
+    perBC!(p.x,p.perdir)
+    Σr,n = loop_reduce(_residual,(+,+),inside(p.x),p.ϵ,p.r,p.x,p.L,p.D,p.iD,regs(p),u,V,T(idt))
+    s = Σr/n
+    abs(s) <= 2eps(T) && return L₁∞(p)
+    loop_reduce(_fix_residual,(+,max),inside(p.x),p.ϵ,p.r,p.iD,s)
+end
+@fastmath @inline function _residual(I,r,x,L,D,iD,reg,u,V,idt)
+    solved = !iszero(@inbounds iD[I])
+    v = solved ? idt*(div(I,u)-δv(D,I)*div(I,V))-mult(I,L,D,reg,x) : zero(eltype(r))
+    @inbounds r[I] = v
+    return v,eltype(r)(solved)
+end
+@inline function _fix_residual(I,r,iD,s)
+    v = iszero(@inbounds iD[I]) ? zero(eltype(r)) : @inbounds(r[I])-s
+    @inbounds r[I] = v
+    return abs(v),abs(v)
 end
 """
     Jacobi!(p::Poisson; it=1)
@@ -359,7 +394,7 @@ Approximate iterative solver for the Poisson matrix equation `Ax=b`.
 """
 function solver!(p::Poisson;tol=2e-3,itmx=1e3,src=nothing)
     r₁tol = l1n_tol(p, tol); r∞tol = tol
-    residual!(p,src); r₁,r∞ = L₁∞(p)
+    r₁,r∞ = residual_L₁∞!(p,src)
     nᵖ=0; @log ", $nᵖ, $r∞, $r₁\n"
     while nᵖ<itmx
         pcg!(p); r₁,r∞ = L₁∞(p); nᵖ+=1
