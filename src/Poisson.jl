@@ -136,6 +136,22 @@ function residual!(p::Poisson)
     perBC!(p.x,p.perdir)
     reg = regs(p)
     @inside p.r[I] = ifelse(p.iD[I]==0,zero(eltype(p.r)),p.z[I]-mult(I,p.L,p.D,reg,p.x))
+    fix_residual!(p)
+end
+"""
+    residual!(p::Poisson,src)
+
+As `residual!(p)`, with the source `z = idt*(div(u)-δv(D)*div(V))` evaluated in the same kernel
+when `src=(u,V,idt)`, so that `z` is neither written nor read. `src=nothing` uses `p.z`.
+"""
+residual!(p::Poisson,::Nothing) = residual!(p)
+function residual!(p::Poisson,(u,V,idt)::Tuple)
+    perBC!(p.x,p.perdir)
+    reg = regs(p)
+    @inside p.r[I] = ifelse(p.iD[I]==0,zero(eltype(p.r)),idt*(div(I,u)-δv(p.D,I)*div(I,V))-mult(I,p.L,p.D,reg,p.x))
+    fix_residual!(p)
+end
+function fix_residual!(p::Poisson)
     s = meanr(get_backend(p.r),p.r,p.iD) # only solved rows absorb the imbalance
     abs(s) <= 2eps(eltype(s)) && return
     @inside p.r[I] = ifelse(p.iD[I]==0,zero(eltype(p.r)),p.r[I]-s)
@@ -164,30 +180,32 @@ Note: This runs for general backends but converges _very_ slowly.
     increment!(p;ω)
 end
 
-@fastmath @inline function gauss(I::CartesianIndex{d},r,L,iD,x) where {d}
+@fastmath @inline function gauss(I::CartesianIndex{d},r,L,iD,x,args...) where {d}
     s = @inbounds(r[I])
     for i in 1:d
-        s -= @inbounds(x[I-δ(i,I)]*L[I,i] + x[I+δ(i,I)]*L[I+δ(i,I),i])
+        s -= at(x,I-δ(i,I),args...)*@inbounds(L[I,i]) + at(x,I+δ(i,I),args...)*@inbounds(L[I+δ(i,I),i])
     end
     return s*@inbounds(iD[I])
 end
-@fastmath @inline function gauss(I::CartesianIndex{d},r,L,iD,reg,x) where {d}
+@fastmath @inline function gauss(I::CartesianIndex{d},r,L,iD,reg::Union{AbstractArray,Nothing},x,args...) where {d}
     ℓ = ℓof(reg,I)
-    iszero(ℓ) && return gauss(I,r,L,iD,x)
+    iszero(ℓ) && return gauss(I,r,L,iD,x,args...)
     s = @inbounds(r[I])
     for i in 1:d
-        s -= ℓ*@inbounds(x[I-δ(i,I)]+x[I+δ(i,I)])
+        s -= ℓ*(at(x,I-δ(i,I),args...)+at(x,I+δ(i,I),args...))
     end
     return s*inv(-2d*ℓ) # iD of a regular cell
 end
 
+# x[I] = gauss(I,…) on colour k₀; the neighbours are read from `y`, which is `x` unless
+# given as a function `y(J,args...)`
 @inline function gauss_rb(x,r,L,iD,k₀,Iv::CartesianIndex{d}) where {d}
     I,ok = rb(x,k₀,Iv)
     ok && (x[I] = gauss(I,r,L,iD,x))
 end
-@inline function gauss_rb(x,r,L,iD,reg,k₀,Iv::CartesianIndex{d}) where {d}
+@inline function gauss_rb(x,r,L,iD,reg,k₀,Iv::CartesianIndex{d},y=x,args...) where {d}
     I,ok = rb(x,k₀,Iv)
-    ok && (x[I] = gauss(I,r,L,iD,reg,x))
+    ok && (x[I] = gauss(I,r,L,iD,reg,y,args...))
 end
 @inline function rb(x,k₀,Iv::CartesianIndex{d}) where {d}
     k = 2*Iv.I[end] - 1 - (sum(Base.front(Iv.I)) + k₀) % 2 # double the k-index and shift for red-black indexing
@@ -206,13 +224,21 @@ Red-black Gauss-Seidel smoother. Runs `it` iterations; a complete red-black cycl
 Note: This performs best on GPU configurations and is the default smoother.
 """
 function GaussSeidelRB!(p::Poisson{T};it=4, ω=1) where {T}
-    @inside p.ϵ[I] = p.r[I]*p.iD[I]  # initialize ϵ
-    perBC!(p.ϵ,p.perdir); reg = regs(p)
-    for i ∈ 1:it
+    reg = regs(p)
+    if isgpu(p.x) && isempty(p.perdir) && it ≥ 2
+        # the first half sweep reads the initial ϵ=r⊙iD on the fly, and the second sets the rest of ϵ
+        @loop gauss_rb(p.ϵ,p.r,p.L,p.iD,reg,1,I,jacobi0,p.r,p.iD) over I ∈ half_rangek(p.ϵ)
+        i₀ = 2
+    else
+        @inside p.ϵ[I] = p.r[I]*p.iD[I]  # initialize ϵ
+        perBC!(p.ϵ,p.perdir); i₀ = 1
+    end
+    for i ∈ i₀:it
         @loop gauss_rb(p.ϵ,p.r,p.L,p.iD,reg,i,I) over I ∈ half_rangek(p.ϵ)
     end
     increment!(p;ω) # increment solution and residual
 end
+@inline jacobi0(J,r,iD) = @inbounds r[J]*iD[J]
 
 using LinearAlgebra: ⋅
 using KernelAbstractions: Backend, GPU
@@ -294,10 +320,11 @@ Approximate iterative solver for the Poisson matrix equation `Ax=b`.
         Convergence also requires the mean residual `Σ|r|/N < tol/10` (same units as the
         max-norm, no hidden exponents: the bulk sits 10× below the cap).
   - `itmx`: Maximum number of iterations.
+  - `src`: `nothing` to use `A.z`, or `(u,V,idt)` for the source of `residual!(p,src)`.
 """
-function solver!(p::Poisson;tol=2e-3,itmx=1e3)
+function solver!(p::Poisson;tol=2e-3,itmx=1e3,src=nothing)
     r₁tol = l1n_tol(p, tol); r∞tol = tol
-    residual!(p); r₁,r∞ = L₁∞(p)
+    residual!(p,src); r₁,r∞ = L₁∞(p)
     nᵖ=0; @log ", $nᵖ, $r∞, $r₁\n"
     while nᵖ<itmx
         pcg!(p); r₁,r∞ = L₁∞(p); nᵖ+=1

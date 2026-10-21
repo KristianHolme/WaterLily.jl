@@ -293,19 +293,36 @@ in the corrector. On return `a.u` is divergence-free and BC-consistent.
 function mom_project!(a::AbstractFlow, b::AbstractPoisson, w::Int, t)
     BC!(a.u,a.uBC,a.exitBC,a.perdir,t)              # BC MUST be at t₁
     w==1 && a.exitBC && exitBC!(a.u,a.u⁰,a.Δt[end]) # convective exit, predictor (w=1) only
-    dt = a.Δt[end]/w; b.x .*= dt                    # initial pressure solution
+    pressure!(a,b,a.Δt[end]/w)
+    BC!(a.u,a.uBC,a.exitBC,a.perdir,t)
+end
+# Solve for the pressure and apply it. A general `AbstractPoisson` solves for `Δt⋅p`:
+function pressure!(a::AbstractFlow,b::AbstractPoisson,dt)
+    b.x .*= dt                                      # initial pressure solution
     Dp = diagonal(b)                                # Poisson matrix diagonal
     @inside b.z[I] = div(I,a.u)-δv(Dp,I)*div(I,a.V) # flow divergence, not BDIM-ϵ stretching
     solver!(b)
     project!(a.u,b.L,b.x)  # apply solution
     b.x ./= dt             # and unscale to recover pressure
-    BC!(a.u,a.uBC,a.exitBC,a.perdir,t)
+end
+# WaterLily's solvers solve for `p` directly, with the source and the tolerance divided by `Δt`.
+# On GPUs the source is evaluated inside the residual instead of being stored in `z`.
+function pressure!(a::AbstractFlow,b::Union{Poisson,MultiLevelPoisson},dt)
+    idt = inv(dt)
+    if isgpu(b.x)
+        solver!(b;tol=2e-3*idt,src=(a.u,a.V,idt))
+    else
+        Dp = diagonal(b)
+        @inside b.z[I] = idt*(div(I,a.u)-δv(Dp,I)*div(I,a.V))
+        solver!(b;tol=2e-3*idt)
+    end
+    project!(a.u,b.L,b.x,dt)
 end
 
-# u -= L∇x: in one kernel on GPUs, and one loop per component on CPUs
-project!(u,L,x) = isgpu(u) ? (@loop u[Ii] -= L[Ii]*∂(last(Ii),Base.front(Ii),x) over Ii ∈ inside_u(size(x))) :
+# u -= s L∇x: in one kernel on GPUs, and one loop per component on CPUs
+project!(u,L,x,s=1) = isgpu(u) ? (@loop u[Ii] -= s*L[Ii]*∂(last(Ii),Base.front(Ii),x) over Ii ∈ inside_u(size(x))) :
     for i ∈ 1:ndims(x)
-        @loop u[I,i] -= L[I,i]*∂(i,I,x) over I ∈ inside(x)
+        @loop u[I,i] -= s*L[I,i]*∂(i,I,x) over I ∈ inside(x)
     end
 
 function CFL(a::AbstractFlow;Δt_max=10)
