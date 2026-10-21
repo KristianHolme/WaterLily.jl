@@ -170,6 +170,40 @@ function increment!(p::Poisson{T};ω=1) where {T}
            p.x[I] = p.x[I]+ω*p.ϵ[I]) over I ∈ inside(p.x)
 end
 """
+    increment_L₁∞!(p::Poisson;ω=1)
+
+`increment!(p;ω)` followed by `L₁∞(p)`, with the norms of each workgroup reduced in the
+increment kernel. The partial norms are kept in `p.z`, which is scratch for the multigrid solver.
+"""
+function increment_L₁∞!(p::Poisson{T};ω=1) where {T}
+    perBC!(p.ϵ,p.perdir); R = inside(p.x); n = length(R); ng = cld(n,NORMGROUP)
+    s,m = view(vec(p.z),1:ng),view(vec(p.z),ng+1:2ng)
+    _increment_L₁∞!(get_backend(p.r),NORMGROUP)(p.r,p.x,p.ϵ,p.L,p.D,regs(p),T(ω),s,m,R;ndrange=ng*NORMGROUP)
+    return mapreduce((a,b)->(a,b),((a,b),(c,d))->(a+c,max(b,d)),s,m;init=(zero(T),zero(T)))
+end
+const NORMGROUP = 256
+@kernel function _increment_L₁∞!(r,x,ϵ,L,D,reg,ω,s,m,R)
+    i = @index(Global,Linear); t = @index(Local,Linear); g = @index(Group,Linear)
+    a = @localmem eltype(r) (NORMGROUP,); b = @localmem eltype(r) (NORMGROUP,)
+    v = zero(eltype(r))
+    if i ≤ length(R)
+        I = @inbounds R[i]
+        @inbounds v = r[I]-ω*mult(I,L,D,reg,ϵ); @inbounds r[I] = v
+        @inbounds x[I] += ω*ϵ[I]
+    end
+    @inbounds a[t] = abs(v); @inbounds b[t] = abs(v)
+    @synchronize
+    k = NORMGROUP÷2
+    while k ≥ 1
+        if t ≤ k
+            @inbounds a[t] += a[t+k]; @inbounds b[t] = max(b[t],b[t+k])
+        end
+        @synchronize
+        k ÷= 2
+    end
+    t == 1 && (@inbounds s[g] = a[1]; @inbounds m[g] = b[1])
+end
+"""
     Jacobi!(p::Poisson; it=1)
 
 Jacobi smoother. Runs `it` iterations with relaxation parameter `ω` scaling the deferred corrections in `increment!`.
@@ -223,7 +257,7 @@ Red-black Gauss-Seidel smoother. Runs `it` iterations; a complete red-black cycl
 `ω` under-/over-relaxs the solution through scaling the deferred corrections in `increment!`.
 Note: This performs best on GPU configurations and is the default smoother.
 """
-function GaussSeidelRB!(p::Poisson{T};it=4, ω=1) where {T}
+function GaussSeidelRB!(p::Poisson{T};it=4, ω=1, norms=false) where {T}
     reg = regs(p)
     if isgpu(p.x) && isempty(p.perdir) && it ≥ 2
         # the first half sweep reads the initial ϵ=r⊙iD on the fly, and the second sets the rest of ϵ
@@ -236,6 +270,7 @@ function GaussSeidelRB!(p::Poisson{T};it=4, ω=1) where {T}
     for i ∈ i₀:it
         @loop gauss_rb(p.ϵ,p.r,p.L,p.iD,reg,i,I) over I ∈ half_rangek(p.ϵ)
     end
+    norms && return increment_L₁∞!(p;ω) # with `norms`, also return L₁∞(p)
     increment!(p;ω) # increment solution and residual
 end
 @inline jacobi0(J,r,iD) = @inbounds r[J]*iD[J]

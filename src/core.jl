@@ -1,4 +1,4 @@
-using KernelAbstractions: get_backend, @index, @kernel, CPU
+using KernelAbstractions: get_backend, @index, @kernel, @localmem, @synchronize, CPU
 using LoggingExtras
 
 """
