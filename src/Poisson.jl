@@ -19,14 +19,14 @@ To help iteratively solve the system above, the Poisson structure holds
 helper arrays for `inv(D)`, the error `ϵ`, and residual `r=z-Ax`. An iterative
 solution method then estimates the error `ϵ=̃A⁻¹r` and increments `x+=ϵ`, `r-=Aϵ`.
 
-`reg[I]=ℓ≠0` flags a regular cell, where `L=ℓ` on all faces (the fluid away from a body).
-The stencils of these cells use `ℓ` instead of reading `L`, `D` and `iD`.
+On GPUs, `reg[I]=ℓ≠0` flags a regular cell, where `L=ℓ` on all faces (the fluid away from a body),
+and the stencils of these cells use `ℓ` instead of reading `L`, `D` and `iD`.
 """
 struct Poisson{T,S<:AbstractArray{T},V<:AbstractArray{T}} <: AbstractPoisson{T,S,V}
     L :: V # Lower diagonal coefficients
     D :: S # Diagonal coefficients
     iD :: S # 1/Diagonal
-    reg :: S # L on all faces of a regular cell, 0 otherwise
+    reg :: S # L on all faces of a regular cell, 0 otherwise (set on GPUs only)
     x :: S # approximate solution
     ϵ :: S # increment/error
     r :: S # residual
@@ -37,17 +37,20 @@ struct Poisson{T,S<:AbstractArray{T},V<:AbstractArray{T}} <: AbstractPoisson{T,S
         @assert axes(x) == axes(z) && axes(x) == Base.front(axes(L)) && last(axes(L)) == eachindex(axes(x))
         r = similar(x); fill!(r,0)
         ϵ,D,iD,reg = copy(r),copy(r),copy(r),copy(r)
-        set_diag!(D,iD,reg,L)
+        isgpu(x) ? set_diag!(D,iD,reg,L) : set_diag!(D,iD,L)
         new{T,typeof(x),typeof(L)}(L,D,iD,reg,x,ϵ,r,z,[],perdir)
     end
 end
 
 using ForwardDiff: Dual,Tag
 Base.eps(::Type{D}) where D<:Dual{Tag{G,T}} where {G,T} = eps(T)
-set_diag!(D,iD,L) = @loop (D[I] = diag(I,L); iD[I] = iszero(D[I]) ? D[I] : inv(D[I])) over I ∈ inside(D)
+function set_diag!(D,iD,L)
+    @inside D[I] = diag(I,L)
+    @inside iD[I] = iszero(D[I]) ? D[I] : inv(D[I])
+end
 set_diag!(D,iD,reg,L) = @loop (D[I] = diag(I,L); iD[I] = iszero(D[I]) ? D[I] : inv(D[I]);
                                reg[I] = regular(I,L)) over I ∈ inside(D)
-update!(p::Poisson) = set_diag!(p.D,p.iD,p.reg,p.L)
+update!(p::Poisson) = isgpu(p.x) ? set_diag!(p.D,p.iD,p.reg,p.L) : set_diag!(p.D,p.iD,p.L) # reg is used on GPUs only
 
 # `L` of cell `I` if it is the same on all its faces, and 0 otherwise
 @inline function regular(I::CartesianIndex{d},L) where {d}

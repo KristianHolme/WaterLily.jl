@@ -297,14 +297,21 @@ function mom_project!(a::AbstractFlow, b::AbstractPoisson, w::Int, t)
     Dp = diagonal(b)                                # Poisson matrix diagonal
     @inside b.z[I] = div(I,a.u)-δv(Dp,I)*div(I,a.V) # flow divergence, not BDIM-ϵ stretching
     solver!(b)
-    @loop a.u[Ii] -= b.L[Ii]*∂(last(Ii),Base.front(Ii),b.x) over Ii ∈ inside_u(size(a.p)) # apply solution
-    b.x ./= dt                                                                         # and unscale to recover pressure
+    project!(a.u,b.L,b.x)  # apply solution
+    b.x ./= dt             # and unscale to recover pressure
     BC!(a.u,a.uBC,a.exitBC,a.perdir,t)
 end
 
+# u -= L∇x: in one kernel on GPUs, and one loop per component on CPUs
+project!(u,L,x) = isgpu(u) ? (@loop u[Ii] -= L[Ii]*∂(last(Ii),Base.front(Ii),x) over Ii ∈ inside_u(size(x))) :
+    for i ∈ 1:ndims(x)
+        @loop u[I,i] -= L[I,i]*∂(i,I,x) over I ∈ inside(x)
+    end
+
 function CFL(a::AbstractFlow;Δt_max=10)
+    fill!(a.σ,0) # the ghosts hold scratch values (such as the fluxes of conv_diff!)
     @inside a.σ[I] = flux_out(I,a.u)
-    min(Δt_max,inv(maximum(view(a.σ,inside(a.σ).indices...))+5a.ν)) # the ghosts hold scratch values
+    min(Δt_max,inv(maximum(a.σ)+5a.ν))
 end
 @fastmath @inline function flux_out(I::CartesianIndex{d},u) where {d}
     s = z = zero(eltype(u))
