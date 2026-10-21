@@ -319,6 +319,8 @@ end
 
 using ForwardDiff
 using ForwardDiff: Dual, partials, Tag
+primal(x::Dual) = primal(ForwardDiff.value(x))
+primal(x) = x
 
 # Inner-derivative tag for measure's gradient/jacobian/derivative. `≺` is
 # overloaded so it always ranks newer than any `ForwardDiff.Tag`, folding the

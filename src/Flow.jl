@@ -308,13 +308,13 @@ end
 # WaterLily's solvers solve for `p` directly, with the source and the tolerance divided by `Δt`.
 # On GPUs the source is evaluated inside the residual instead of being stored in `z`.
 function pressure!(a::AbstractFlow,b::Union{Poisson,MultiLevelPoisson},dt)
-    idt = inv(dt)
+    idt = inv(dt); tol = 2e-3/primal(dt) # the tolerance is a number, also when Δt is a `Dual`
     if isgpu(b.x)
-        solver!(b;tol=2e-3*idt,src=(a.u,a.V,idt))
+        solver!(b;tol,src=(a.u,a.V,idt))
     else
         Dp = diagonal(b)
         @inside b.z[I] = idt*(div(I,a.u)-δv(Dp,I)*div(I,a.V))
-        solver!(b;tol=2e-3*idt)
+        solver!(b;tol)
     end
     project!(a.u,b.L,b.x,dt)
 end
