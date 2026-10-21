@@ -88,6 +88,22 @@ end
 function Vcycle!(ml::MultiLevelPoisson;l=1,ω=1)
     fine,coarse = ml.levels[l],ml.levels[l+1]
     c = coarsen_mask(fine.x,coarse.x)
+    isgpu(fine.x) || return Vcycle_cpu!(ml,fine,coarse,c;l,ω)
+    r,ϵ,x,L,D,iD,reg,cr,cx = fine.r,fine.ϵ,fine.x,fine.L,fine.D,fine.iD,regs(fine),coarse.r,coarse.x
+    N,per = size(x),perarg(x,fine.perdir)
+    # set up coarse level: Jacobi! with ϵ=r⊙iD evaluated on the fly, and its residual stored in ϵ
+    @loop (ϵ[I] = r[I]-mult(I,L,D,reg,jacobi,r,iD,N,per);
+           x[I] += jacobi(I,r,iD,N,per)) over I ∈ inside(x)
+    @loop (cr[I] = restrict(I,ϵ,c); cx[I] = zero(eltype(cx))) over I ∈ inside(cx)
+    # solve coarse (with recursion if possible)
+    l+1<length(ml.levels) && Vcycle!(ml,l=l+1; ω)
+    smooth!(coarse;ω)
+    # correct fine: increment! with ϵ=prolongate!(coarse.x) evaluated on the fly, from the residual in ϵ
+    @loop (r[I] = ϵ[I]-ω*mult(I,L,D,reg,prolong,cx,c,N,per);
+           x[I] += ω*prolong(I,cx,c,N,per)) over I ∈ inside(x)
+end
+# The V-cycle with stored increments: on CPUs, evaluating them on the fly costs more than the passes it saves
+function Vcycle_cpu!(ml,fine,coarse,c;l,ω)
     # set up coarse level
     Jacobi!(fine)
     restrict!(coarse.r,fine.r,c)
@@ -99,6 +115,9 @@ function Vcycle!(ml::MultiLevelPoisson;l=1,ω=1)
     prolongate!(fine.ϵ,coarse.x,c)
     increment!(fine; ω)
 end
+# Jacobi! and prolongate! increments at J, including the periodic copies in the ghosts that perBC! would fill
+@inline jacobi(J,r,iD,N,per) = (J = wrap(J,N,per); @inbounds r[J]*iD[J])
+@inline prolong(J,cx,c,N,per) = @inbounds cx[down(wrap(J,N,per),c)]
 
 mult!(ml::MultiLevelPoisson,x) = mult!(ml.levels[1],x)
 residual!(ml::MultiLevelPoisson,x) = residual!(ml.levels[1],x)
@@ -109,12 +128,12 @@ const smooth! = GaussSeidelRB!
 function solver!(ml::MultiLevelPoisson{T};tol=2e-3,itmx=32) where T
     p = ml.levels[1]
     r₁tol = l1n_tol(p, tol); r∞tol = tol
-    residual!(p); r₁ = L₁(p); r∞ = L∞(p); ω = T(1)
+    residual!(p); r₁,r∞ = L₁∞(p); ω = T(1)
     nᵖ=0; @log ", $nᵖ, $r∞, $r₁, $ω\n"
     while nᵖ<itmx
         Vcycle!(ml; ω)
         smooth!(p; ω);
-        rnew = L₁(p); r∞ = L∞(p); nᵖ+=1
+        rnew,r∞ = L₁∞(p); nᵖ+=1
         @log ", $nᵖ, $r∞, $rnew, $ω\n"
         if     rnew ≥ r₁
             ω = max(0.2, 0.9ω) |> T
