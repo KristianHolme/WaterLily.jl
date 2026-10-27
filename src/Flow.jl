@@ -255,10 +255,13 @@ end
 project!(u,L,x,s=1) = @loop u[I,i] -= s*L[I,i]*∂(i,I,x) over I ∈ inside(x), i ∈ 1:ndims(x)
 
 function CFL(a::AbstractFlow;Δt_max=10)
+    # on GPUs the maximum is reduced in the loop, with σ as the scratch array of the partials
+    isgpu(a.σ) && return min(Δt_max,inv(first(loop_reduce(_flux_out,(max,max),inside(a.p),a.σ,a.u))+5a.ν))
     fill!(a.σ,0) # the ghosts hold scratch values (such as the fluxes of conv_diff!)
     @inside a.σ[I] = flux_out(I,a.u)
     min(Δt_max,inv(maximum(a.σ)+5a.ν))
 end
+@inline _flux_out(I,u) = (s = flux_out(I,u); (s,s))
 @fastmath @inline function flux_out(I::CartesianIndex{d},u) where {d}
     s = z = zero(eltype(u))
     for i in 1:d
