@@ -176,21 +176,22 @@ memory and writes them to the scratch array `buf`, which `f` must not use; the p
 reduced in one small `mapreduce`.
 """
 function loop_reduce(f::F,(op₁,op₂),R,buf,args...) where F
-    T = eltype(buf); ng = cld(length(R),REDUCEGROUP)
+    T = eltype(buf); tl = tiles(R); ng = ngroups(tl)
     @assert 2ng ≤ length(buf) "loop_reduce: the scratch array is too small for the partials"
     s,m = view(vec(buf),1:ng),view(vec(buf),ng+1:2ng)
-    _loop_reduce!(get_backend(buf),REDUCEGROUP)(f,op₁,op₂,s,m,R,args;ndrange=ng*REDUCEGROUP)
+    _loop_reduce!(get_backend(buf),LOOPGROUP)(f,op₁,op₂,s,m,R,tl,args;ndrange=ng*LOOPGROUP)
     return mapreduce((a,b)->(a,b),((a,b),(c,d))->(op₁(a,c),op₂(b,d)),s,m;init=(zero(T),zero(T)))
 end
-const REDUCEGROUP = 256 # work-items per work-group of loop_reduce
-@kernel function _loop_reduce!(f,op₁,op₂,s,m,R,args)
-    i = @index(Global,Linear); t = @index(Local,Linear); g = @index(Group,Linear)
-    a = @localmem eltype(s) (REDUCEGROUP,); b = @localmem eltype(s) (REDUCEGROUP,)
+# the work-groups are the tiles of `@loop`
+@kernel unsafe_indices=true function _loop_reduce!(f,op₁,op₂,s,m,R,tl,args)
+    t = @index(Local,Linear); g = @index(Group,Linear)
+    J,ok = tileindex(R,tl,g,t)
+    a = @localmem eltype(s) (LOOPGROUP,); b = @localmem eltype(s) (LOOPGROUP,)
     v₁ = v₂ = zero(eltype(s))
-    i ≤ length(R) && ((v₁,v₂) = f(@inbounds(R[i]),args...))
+    ok && ((v₁,v₂) = f(@inbounds(R[J]),args...))
     @inbounds a[t] = v₁; @inbounds b[t] = v₂
     @synchronize
-    k = REDUCEGROUP÷2
+    k = LOOPGROUP÷2
     while k ≥ 1
         t ≤ k && (@inbounds a[t] = op₁(a[t],a[t+k]); @inbounds b[t] = op₂(b[t],b[t+k]))
         @synchronize
