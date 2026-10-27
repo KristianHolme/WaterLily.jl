@@ -269,6 +269,20 @@ function exitBC!(u,u⁰,Δt)
     @loop u[I,1] -= ∮u over I ∈ face(exitR,1)     # correct flux
 end
 """
+    wrap(I,N,per)
+
+`I` with its ghost indices in the periodic directions (`per[j]`) replaced by the interior cells they copy.
+"""
+@inline wrap(I::CartesianIndex{d},N,per) where d = CI(ntuple(@inline(j-> per[j] ? (I[j]==1 ? N[j]-1 : I[j]==N[j] ? 2 : I[j]) : I[j]), Val(d)))
+pertuple(perdir,::Val{d}) where d = ntuple(j-> (j in perdir)::Bool, Val(d))
+# `per` for the kernels of array `a`: on a GPU as a type, so that `wrap` folds to `I` in the directions that
+# are not periodic (making the type is dynamic, which the CPU backends avoid)
+perarg(a,perdir) = perarg(get_backend(a),perdir,Val(ndims(a)))
+perarg(::CPU,perdir,d) = pertuple(perdir,d)
+perarg(_,perdir,d) = Val(pertuple(perdir,d))
+@inline wrap(I::CartesianIndex,N,::Val{per}) where per = wrap(I,N,per)
+
+"""
     perBC!(a,perdir)
 
 Apply periodic conditions to the ghost cells of a _scalar_ field.
