@@ -37,6 +37,18 @@ end
     end
 end
 
+@testset "loop_reduce" begin # GPUs only
+    for f ∈ arrays
+        a = f(rand(Float32,10,9,7)); WaterLily.isgpu(a) || continue
+        R = inside(a); b = Array(a)[R]
+        @test all(WaterLily.loop_reduce((I,a)->(a[I],a[I]),(+,max),R,similar(a),a) .≈ (sum(b),maximum(b)))
+        c = ones(Float32,10,9,7,3); BC!(c,(0,0,0)) # residual_L₁∞! as residual! and L₁∞
+        p = Poisson(f(rand(Float32,10,9,7)),f(c),f(rand(Float32,10,9,7)))
+        n = WaterLily.residual_L₁∞!(p); r = Array(p.r)
+        WaterLily.residual!(p); @test Array(p.r) ≈ r && all(n .≈ WaterLily.L₁∞(p))
+    end
+end
+
 @testset "Red-black Gauss-Seidel sweeps" begin # every interior cell of the swept colour, also with odd sizes
     sweep_ref!(ϵ,r,L,iD,k₀) = for I ∈ inside(ϵ); isodd(sum(I.I)+k₀) && (ϵ[I] = WaterLily.gauss(I,r,L,iD,ϵ)); end
     for f ∈ arrays, dims ∈ ((10,11),(10,12,8),(10,9,7))
