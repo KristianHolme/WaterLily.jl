@@ -1,5 +1,12 @@
-using KernelAbstractions: get_backend, @index, @kernel
+using KernelAbstractions: get_backend, @index, @kernel, CPU
 using LoggingExtras
+
+"""
+    isgpu(a)
+
+Whether array `a` is on a GPU backend, where kernels are bound by memory traffic and launch latency.
+"""
+isgpu(a) = !(get_backend(a) isa CPU)
 
 # custom log macro
 _psolver = Logging.LogLevel(-123) # custom log level for pressure solver, needs the negative sign

@@ -102,6 +102,16 @@ end
     end
 end
 
+@testset "residual! with its source" begin # as with the source stored in z, here with a moving body (V≠0)
+    for f ∈ arrays
+        sim = Simulation((32,32),(1,0),8;ν=0.01,mem=f,T=Float32,body=AutoBody((x,t)->√sum(abs2,x .- 12 .- t)-4))
+        sim_step!(sim,0.2); a,p = sim.flow,sim.pois.levels[1]; idt = inv(a.Δt[end])
+        WaterLily.residual!(p,(a.u,a.V,idt)); r = Array(p.r)
+        @inside p.z[I] = idt*(WaterLily.div(I,a.u)-WaterLily.δv(p.D,I)*WaterLily.div(I,a.V))
+        WaterLily.residual!(p); @test Array(p.r) ≈ r
+    end
+end
+
 @testset "scale_u! scales the interior velocity" begin # not used by mom_step!, kept for codes that write their own
     for f ∈ arrays
         flow = Flow((8,6),(1,0);mem=f,T=Float32); flow.u .= 2
