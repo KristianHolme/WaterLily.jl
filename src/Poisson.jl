@@ -202,6 +202,9 @@ L₂(p::Poisson) = p.r ⋅ p.r # special method since outside(p.r)≡0
 L₁(p::Poisson) = sum(abs,p.r) # special method since outside(p.r)≡0
 L∞(p::Poisson) = maximum(abs,p.r)
 
+# default tolerance of `solver!`
+const default_tol = 2e-3
+
 # mean residual  Σ|r|/N < tol/10   ⟺   L₁(p)=Σ|r| < (tol/10)·N
 l1n_tol(p::AbstractPoisson, tol) = (Float64(tol)/10) * length(inside(p.r))
 
@@ -221,7 +224,7 @@ Approximate iterative solver for the Poisson matrix equation `Ax=b`.
         max-norm, no hidden exponents: the bulk sits 10× below the cap).
   - `itmx`: Maximum number of iterations.
 """
-function solver!(p::Poisson;tol=2e-3,itmx=1e3)
+function solver!(p::Poisson;tol=default_tol,itmx=1e3)
     r₁tol = l1n_tol(p, tol); r∞tol = tol
     residual!(p); r₁ = L₁(p); r∞ = L∞(p)
     nᵖ=0; @log ", $nᵖ, $r∞, $r₁\n"
