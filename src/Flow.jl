@@ -64,7 +64,7 @@ end
 Accounts for applied and reference-frame acceleration using `rᵢ += g(i,x,t)+dU(i,x,t)/dt`
 """
 accelerate!(r,t,::Nothing,::Union{Nothing,Tuple}) = nothing
-accelerate!(r,t,f::Function) = @loop r[Ii] += f(last(Ii),loc(Ii,eltype(r)),t) over Ii ∈ CartesianIndices(r)
+accelerate!(r,t,f::Function) = @loop r[I,i] += f(i,loc(i,I,eltype(r)),t) over I ∈ CartesianIndices(Base.front(size(r))), i ∈ 1:last(size(r))
 accelerate!(r,t,g::Function,::Union{Nothing,Tuple}) = accelerate!(r,t,g)
 accelerate!(r,t,::Nothing,U::Function) = accelerate!(r,t,(i,x,t)->derivative(τ->U(i,x,τ),t))
 accelerate!(r,t,g::Function,U::Function) = accelerate!(r,t,(i,x,t)->g(i,x,t)+derivative(τ->U(i,x,τ),t))
@@ -76,7 +76,7 @@ Apply a vector function `f(i,x)` to the faces of a uniform staggered array `c` o
 a function `f(x)` to the center of a uniform array `c`.
 """
 apply!(f,c) = hasmethod(f,Tuple{Int,CartesianIndex}) ? applyV!(f,c) : applyS!(f,c)
-applyV!(f,c) = @loop c[Ii] = f(last(Ii),loc(Ii,eltype(c))) over Ii ∈ CartesianIndices(c)
+applyV!(f,c) = @loop c[I,i] = f(i,loc(i,I,eltype(c))) over I ∈ CartesianIndices(Base.front(size(c))), i ∈ 1:last(size(c))
 applyS!(f,c) = @loop c[I] = f(loc(0,I,eltype(c))) over I ∈ CartesianIndices(c)
 
 ic_function(uBC::Function) = (i,x)->uBC(i,x,0)
@@ -179,8 +179,8 @@ time(a::AbstractFlow) = sum(@view(a.Δt[1:end-1]))
 
 function BDIM!(a::AbstractFlow,s=1)
     dt = a.Δt[end]
-    @loop a.f[Ii] = a.u⁰[Ii]+dt*a.f[Ii]-a.V[Ii] over Ii in CartesianIndices(a.f)
-    @loop a.u[Ii] = (a.u[Ii]+(μddn(Ii,a.μ₁,a.f)+a.V[Ii]+a.μ₀[Ii]*a.f[Ii]))/s over Ii ∈ inside_u(size(a.p))
+    @loop a.f[I,i] = a.u⁰[I,i]+dt*a.f[I,i]-a.V[I,i] over I ∈ CartesianIndices(a.p), i ∈ 1:ndims(a.p)
+    @loop a.u[I,i] = (a.u[I,i]+(μddn(CI(I,i),a.μ₁,a.f)+a.V[I,i]+a.μ₀[I,i]*a.f[I,i]))/s over I ∈ inside(a.p), i ∈ 1:ndims(a.p)
 end
 
 """
@@ -209,7 +209,7 @@ function mom_correct!(a::AbstractFlow, t; udf=nothing, kwargs...)
     accelerate!(a.f,t,a.g,a.uBC)
     BDIM!(a,2)
 end
-scale_u!(a::AbstractFlow{D,T},s) where {D,T} = (s=T(s); @loop a.u[Ii] *= s over Ii ∈ inside_u(size(a.p)))
+scale_u!(a::AbstractFlow{D,T},s) where {D,T} = (s=T(s); @loop a.u[I,i] *= s over I ∈ inside(a.p), i ∈ 1:D)
 
 """
     mom_project!(a::AbstractFlow, b::AbstractPoisson, w::Int, t; kwargs...)
@@ -225,10 +225,8 @@ function mom_project!(a::AbstractFlow, b::AbstractPoisson, w::Int, t; kwargs...)
     Dp = diagonal(b)                                # Poisson matrix diagonal
     @inside b.z[I] = div(I,a.u)-δv(Dp,I)*div(I,a.V) # flow divergence, not BDIM-ϵ stretching
     solver!(b; kwargs...)
-    for i ∈ 1:ndims(a.p)  # apply solution and unscale to recover pressure
-        @loop a.u[I,i] -= b.L[I,i]*∂(i,I,b.x) over I ∈ inside(b.x)
-    end
-    b.x ./= dt
+    @loop a.u[I,i] -= b.L[I,i]*∂(i,I,b.x) over I ∈ inside(b.x), i ∈ 1:ndims(b.x) # apply solution
+    b.x ./= dt # unscale to recover pressure
     BC!(a.u,a.uBC,a.exitBC,a.perdir,t)
 end
 
