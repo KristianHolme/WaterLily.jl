@@ -1,5 +1,12 @@
-using KernelAbstractions: get_backend, @index, @kernel
+using KernelAbstractions: get_backend, @index, @kernel, CPU
 using LoggingExtras
+
+"""
+    isgpu(a)
+
+Whether array `a` is on a GPU backend, where kernels are bound by memory traffic and launch latency.
+"""
+isgpu(a) = !(get_backend(a) isa CPU)
 
 # custom log macro
 _psolver = Logging.LogLevel(-123) # custom log level for pressure solver, needs the negative sign
@@ -230,6 +237,14 @@ so a convective outflow set by `exitBC!` is kept and every other face is always 
 BC!(a,U,saveexit=false,perdir=(),t=0) = BC!(a,(i,x,t)->U[i],saveexit,perdir,t)
 function BC!(a,uBC::Function,saveexit=false,perdir=(),t=0)
     N,n = size_u(a)
+    isgpu(a) || return BC_cpu!(a,uBC,saveexit,perdir,t,N,n)
+    for j ∈ 1:n # one launch per direction: each thread sets every component on both faces normal to `j`
+        per = j in perdir
+        @loop BCj!(a,I,j,N,uBC,saveexit,per,t) over I ∈ face(N,1,j)
+    end
+end
+# One loop per component and face, which is faster on CPUs
+function BC_cpu!(a,uBC,saveexit,perdir,t,N,n)
     for i ∈ 1:n, j ∈ 1:n
         if j in perdir
             @loop a[I,i] = a[CIj(j,I,N[j]-1),i] over I ∈ face(N,1,j)
@@ -244,6 +259,22 @@ function BC!(a,uBC::Function,saveexit=false,perdir=(),t=0)
                 @loop a[I,i] = uBC(i,loc(i,I,eltype(a)),t)+a[I+δ(j,I),i]-uBC(i,loc(i,I+δ(j,I),eltype(a)),t) over I ∈ face(N,1,j)
                 @loop a[I,i] = uBC(i,loc(i,I,eltype(a)),t)+a[I-δ(j,I),i]-uBC(i,loc(i,I-δ(j,I),eltype(a)),t) over I ∈ face(N,N[j],j)
             end
+        end
+    end
+end
+# The components are independent, and each one sees the directions in order, so the edges get the same values
+# as from one loop per component and direction
+@fastmath @inline function BCj!(a,I,j,N,uBC,saveexit,per,t)
+    T = eltype(a); Iu = CIj(j,I,N[j]); I2 = CIj(j,I,2)
+    for i ∈ 1:length(N)
+        if per
+            a[I,i] = a[CIj(j,I,N[j]-1),i]; a[Iu,i] = a[I2,i]
+        elseif i==j # Normal direction, Dirichlet
+            a[I,i] = uBC(i,loc(i,I,T),t); a[I2,i] = uBC(i,loc(i,I2,T),t)
+            (!saveexit || i>1) && (a[Iu,i] = uBC(i,loc(i,Iu,T),t)) # overwrite exit
+        else    # Tangential directions, Neumann
+            a[I,i] = uBC(i,loc(i,I,T),t)+a[I2,i]-uBC(i,loc(i,I2,T),t)
+            a[Iu,i] = uBC(i,loc(i,Iu,T),t)+a[Iu-δ(j,I),i]-uBC(i,loc(i,Iu-δ(j,I),T),t)
         end
     end
 end
