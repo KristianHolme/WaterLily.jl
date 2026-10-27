@@ -78,7 +78,7 @@ end
 end
 
 """
-    residual!(p::Poisson)
+    residual!(p::Poisson,src=nothing)
 
 Computes the residual `r = z-Ax` and corrects it such that
 `r = 0` if `iD==0` which ensures local satisfiability
@@ -90,14 +90,19 @@ minimizing the local effect. Other approaches are possible.
 
 Note: These corrections mean `x` is not strictly solving `Ax=z`, but
 without the corrections, no solution exists.
+
+With `src=(u,V,idt)`, the source `z = idt*(div(u)-δv(D)*div(V))` is evaluated in the
+residual kernel, and `p.z` is neither read nor written.
 """
-function residual!(p::Poisson)
+function residual!(p::Poisson,src=nothing)
     perBC!(p.x,p.perdir)
-    @inside p.r[I] = ifelse(p.iD[I]==0,zero(eltype(p.r)),p.z[I]-mult(I,p.L,p.D,p.x))
+    @inside p.r[I] = ifelse(p.iD[I]==0,zero(eltype(p.r)),source(I,p.z,p.D,src)-mult(I,p.L,p.D,p.x))
     s = meanr(p.r,p.iD) # only solved rows absorb the imbalance
     abs(s) <= 2eps(eltype(s)) && return
     @inside p.r[I] = ifelse(p.iD[I]==0,zero(eltype(p.r)),p.r[I]-s)
 end
+@inline source(I,z,D,::Nothing) = @inbounds z[I]
+@inline source(I,z,D,(u,V,idt)::Tuple) = idt*(div(I,u)-δv(D,I)*div(I,V))
 
 function increment!(p::Poisson{T};ω=1) where {T}
     perBC!(p.ϵ,p.perdir)
@@ -238,10 +243,11 @@ Approximate iterative solver for the Poisson matrix equation `Ax=b`.
         Convergence also requires the mean residual `Σ|r|/N < tol/10` (same units as the
         max-norm, no hidden exponents: the bulk sits 10× below the cap).
   - `itmx`: Maximum number of iterations.
+  - `src`: `nothing` to use `A.z`, or `(u,V,idt)` for the source of `residual!(A,src)`.
 """
-function solver!(p::Poisson;tol=default_tol,itmx=1e3)
+function solver!(p::Poisson;tol=default_tol,itmx=1e3,src=nothing)
     r₁tol = l1n_tol(p, tol); r∞tol = tol
-    residual!(p); r₁,r∞ = L₁∞(p)
+    residual!(p,src); r₁,r∞ = L₁∞(p)
     nᵖ=0; @log ", $nᵖ, $r∞, $r₁\n"
     while nᵖ<itmx
         pcg!(p); r₁,r∞ = L₁∞(p); nᵖ+=1
