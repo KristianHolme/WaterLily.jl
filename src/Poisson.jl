@@ -177,11 +177,17 @@ the scratch array.
 """
 function residual_L₁∞!(p::Poisson{T},src=nothing) where {T}
     isgpu(p.x) || (residual!(p,src); return L₁∞(p))
+    s = residual_mean!(p,src)
+    iszero(s) && return L₁∞(p)
+    loop_reduce(_fix_residual,(+,max),inside(p.x),p.ϵ,p.r,p.iD,s)
+end
+# The residual kernel of `residual_L₁∞!` (GPUs): `r` without the correction, and the mean `s` that the
+# correction subtracts from it (zero when negligible)
+function residual_mean!(p::Poisson{T},src=nothing) where {T}
     perBC!(p.x,p.perdir)
     Σr,n = loop_reduce(_residual,(+,+),inside(p.x),p.ϵ,p.r,p.x,p.z,p.L,p.D,p.iD,src)
     s = Σr/n # only solved rows absorb the imbalance
-    abs(s) <= 2eps(T) && return L₁∞(p)
-    loop_reduce(_fix_residual,(+,max),inside(p.x),p.ϵ,p.r,p.iD,s)
+    return abs(s) <= 2eps(T) ? zero(T) : s
 end
 @fastmath @inline function _residual(I,r,x,z,L,D,iD,src)
     solved = !iszero(@inbounds iD[I])
