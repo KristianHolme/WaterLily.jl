@@ -1,5 +1,12 @@
-using KernelAbstractions: get_backend, @index, @kernel
+using KernelAbstractions: get_backend, @index, @kernel, CPU
 using LoggingExtras
+
+"""
+    isgpu(a)
+
+Whether array `a` is on a GPU backend, where kernels are bound by memory traffic and launch latency.
+"""
+isgpu(a) = !(get_backend(a) isa CPU)
 
 # custom log macro
 _psolver = Logging.LogLevel(-123) # custom log level for pressure solver, needs the negative sign
@@ -261,6 +268,8 @@ function exitBC!(u,u⁰,Δt)
     ∮u = sum(@view(u[exitR,1]))/length(exitR)-U   # mass flux imbalance
     @loop u[I,1] -= ∮u over I ∈ face(exitR,1)     # correct flux
 end
+pertuple(perdir,::Val{d}) where d = ntuple(j-> (j in perdir)::Bool, Val(d))
+
 """
     perBC!(a,perdir)
 

@@ -68,6 +68,38 @@ accelerate!(r,t,f::Function) = @loop r[Ii] += f(last(Ii),loc(Ii,eltype(r)),t) ov
 accelerate!(r,t,g::Function,::Union{Nothing,Tuple}) = accelerate!(r,t,g)
 accelerate!(r,t,::Nothing,U::Function) = accelerate!(r,t,(i,x,t)->derivative(τ->U(i,x,τ),t))
 accelerate!(r,t,g::Function,U::Function) = accelerate!(r,t,(i,x,t)->g(i,x,t)+derivative(τ->U(i,x,τ),t))
+# the function `(i,x,t)->gᵢ` that accelerate! adds, or nothing
+acceleration(::Nothing,::Union{Nothing,Tuple}) = nothing
+acceleration(g::Function,::Union{Nothing,Tuple}) = g
+acceleration(::Nothing,U::Function) = (i,x,t)->derivative(τ->U(i,x,τ),t)
+acceleration(g::Function,U::Function) = (i,x,t)->g(i,x,t)+derivative(τ->U(i,x,τ),t)
+@inline gᵢ(::Nothing,Ii,t) = zero(t)
+@inline gᵢ(g,Ii,t) = g(last(Ii),loc(Ii,typeof(t)),t)
+
+# Flux of uᵢ through the lower j-face of the cell, as `conv_diff!` stores it in Φ: the interior flux reads
+# the far upwind value only, and the boundary fluxes are those of `boundaries!`
+@fastmath @inline function Φ(j,Ii::CartesianIndex,u,ν,λ::F,N,per) where {F}
+    I,i = Base.front(Ii),last(Ii)
+    2<I[j]<N[j] && return Φᵢ(j,Ii,u,ν,λ)
+    per[j] && I[j]==N[j] && (Ii = CIj(j,Ii,2); I = Base.front(Ii)) # the upper periodic face is the lower one
+    uf = ϕ(i,CI(I,j),u)
+    I[j]==N[j] && return ϕuR(j,Ii,u,uf,λ)-ν*∂(j,Ii,u)
+    return (per[j] ? ϕuP(j,CIj(j,Ii,N[j]-2),Ii,u,uf,λ) : ϕuL(j,Ii,u,uf,λ))-ν*∂(j,Ii,u)
+end
+# `Φ` of an interior face, 2<I[j]<N[j]
+@fastmath @inline function Φᵢ(j,Ii::CartesianIndex,u,ν,λ::F) where {F}
+    uf = ϕ(last(Ii),CI(Base.front(Ii),j),u); c,b = @inbounds(u[Ii]),@inbounds(u[Ii-δ(j,Ii)]); p = uf>0
+    return uf*λ(@inbounds(u[ifelse(p,Ii-2δ(j,Ii),Ii+δ(j,Ii))]),ifelse(p,b,c),ifelse(p,c,b))-ν*(c-b)
+end
+# `r[Ii]` of conv_diff!: the net flux into the cell, also in the ghosts (zero in the lower ones, and without
+# the faces normal to j in the upper ones of j)
+@inline function rhs(Ii::CartesianIndex{m},u,ν,λ::F,N,per) where {m,F}
+    z = zero(eltype(u))
+    any(ntuple(@inline(j->Ii[j]==1),Val(m-1))) && return z
+    sum(ntuple(@inline(j->Ii[j]<N[j] ? Φ(j,Ii,u,ν,λ,N,per)-Φ(j,Ii+δ(j,Ii),u,ν,λ,N,per) : z),Val(m-1)))
+end
+# `f[Ii]` after the first loop of BDIM!: u⁰+Δt(r+g)-V
+@fastmath @inline f̃(Ii,u,u⁰,V,Δt,ν,λ,N,per,g,t) = @inbounds(u⁰[Ii])+Δt*(rhs(Ii,u,ν,λ,N,per)+gᵢ(g,Ii,t))-@inbounds(V[Ii])
 
 """
     apply!(f, c)
@@ -158,7 +190,7 @@ and the `AbstractPoisson` pressure solver to project the velocity onto an incomp
 `kwargs` are passed to `udf` and `poisson_kwargs` to `solver!`.
 """
 @fastmath function mom_step!(a::AbstractFlow,b::AbstractPoisson;udf=nothing,poisson_kwargs=(;),kwargs...)
-    a.u⁰ .= a.u; fill!(a.u,0); t₁ = sum(a.Δt); t₀ = t₁-a.Δt[end]
+    a.u⁰ .= a.u; fused(a,udf) || fill!(a.u,0); t₁ = sum(a.Δt); t₀ = t₁-a.Δt[end]
     # predictor u → u'
     @log "p"
     mom_predict!(a,t₀,t₁;udf,kwargs...)
@@ -191,6 +223,7 @@ Predictor phase of `mom_step!`: advect under `u⁰` with the convective scheme `
 by `mom_project!`.
 """
 function mom_predict!(a::AbstractFlow, t₀, t₁; udf=nothing, kwargs...)
+    fused(a,udf) && return BDIM!(a,a.u,a.u⁰,t₀)
     conv_diff!(a.f,a.u⁰,a.σ,a.λ;ν=a.ν,perdir=a.perdir)
     udf!(a,udf,a.u⁰,t₀; kwargs...) # advect with u⁰
     accelerate!(a.f,t₀,a.g,a.uBC)
@@ -204,12 +237,50 @@ Corrector phase of `mom_step!`: advect under the projected `u` with the convecti
 apply BDIM and blend with the trapezoidal weight.
 """
 function mom_correct!(a::AbstractFlow, t; udf=nothing, kwargs...)
+    if fused(a,udf) # the fluxes read a.u, so it is overwritten after the update
+        BDIM!(a,a.f,a.u,t,2)
+        return @loop a.u[Ii] = a.f[Ii] over Ii ∈ inside_u(size(a.p))
+    end
     conv_diff!(a.f,a.u,a.σ,a.λ;ν=a.ν,perdir=a.perdir)
     udf!(a,udf,a.u,t; kwargs...) # advect with projected a.u
     accelerate!(a.f,t,a.g,a.uBC)
     BDIM!(a,2)
 end
 scale_u!(a::AbstractFlow{D,T},s) where {D,T} = (s=T(s); @loop a.u[Ii] *= s over Ii ∈ inside_u(size(a.p)))
+
+"""
+    fused(a::AbstractFlow,udf)
+
+Whether the predictor and corrector of `a` use the fused `BDIM!(a,out,u,t,s)`. This is the case for a `Flow`
+on a GPU without a `udf`, which needs `r` in `a.f`.
+"""
+fused(a::Flow,::Nothing) = isgpu(a.u)
+fused(a,udf) = false
+
+"""
+    BDIM!(a::Flow,out,u,t,s=1)
+
+`out=((s-1)u+v)/s` over the inside faces, where `v` is the BDIM velocity of `conv_diff!(u)`,
+`accelerate!` and `BDIM!` at time `t`, in one pass. `r` is not stored in `a.f`, nor the fluxes in `a.σ`:
+each flux is evaluated by both of its cells, which pays where memory traffic dominates.
+"""
+function BDIM!(a::Flow{D,T},out,u,t,s=1) where {D,T}
+    u⁰,V,μ₀,μ₁,Δt,ν,λ = a.u⁰,a.V,a.μ₀,a.μ₁,a.Δt[end],a.ν,a.λ
+    N,per,g,t,s = size(a.p),pertuple(a.perdir,Val(D)),acceleration(a.g,a.uBC),T(t),T(s)
+    @loop out[Ii] = ((s-1)*u[Ii]+bdim(Ii,u,u⁰,V,μ₀,μ₁,Δt,ν,λ,N,per,g,t))/s over Ii ∈ inside_u(N)
+end
+# `μddn(Ii,μ₁,f)+V[Ii]+μ₀[Ii]*f[Ii]` of BDIM!, with f evaluated on the fly. Faces with μ₀=1 have μ₁=0 (it is
+# O(ϵ eps^⅔) where μ₀ rounds to 1), so V cancels and only f[Ii] is needed: the BDIM is one read of μ₀ in the fluid
+@fastmath @inline function bdim(Ii::CartesianIndex{m},u,u⁰,V,μ₀,μ₁,Δt,ν,λ,N,per,g,t) where {m}
+    μ = @inbounds μ₀[Ii]
+    μ==1 && return @inbounds(u⁰[Ii])+Δt*(rhs(Ii,u,ν,λ,N,per)+gᵢ(g,Ii,t))
+    s = sum(ntuple(@inline(j->μ₁∂f̃(j,Ii,μ₁,u,u⁰,V,Δt,ν,λ,N,per,g,t)),Val(m-1)))
+    return s/2+@inbounds(V[Ii])+(iszero(μ) ? μ : μ*f̃(Ii,u,u⁰,V,Δt,ν,λ,N,per,g,t)) # μ₀=0 in the body and on the domain faces
+end
+@fastmath @inline function μ₁∂f̃(j,Ii,μ₁,args...) # a term of μddn
+    μ = @inbounds μ₁[Ii,j]
+    iszero(μ) ? zero(μ) : μ*(f̃(Ii+δ(j,Ii),args...)-f̃(Ii-δ(j,Ii),args...))
+end
 
 """
     mom_project!(a::AbstractFlow, b::AbstractPoisson, w::Int, t; kwargs...)
