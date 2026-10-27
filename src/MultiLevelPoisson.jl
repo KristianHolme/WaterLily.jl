@@ -137,6 +137,7 @@ end
 mult!(ml::MultiLevelPoisson,x) = mult!(ml.levels[1],x)
 residual!(ml::MultiLevelPoisson,x) = residual!(ml.levels[1],x)
 diagonal(ml::MultiLevelPoisson) = diagonal(ml.levels[1])
+regs(ml::MultiLevelPoisson) = regs(ml.levels[1])
 
 const smooth! = GaussSeidelRB!
 

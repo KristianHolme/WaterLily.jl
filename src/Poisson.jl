@@ -18,11 +18,17 @@ ect can be easily implemented and optimized without external libraries.
 To help iteratively solve the system above, the Poisson structure holds
 helper arrays for `inv(D)`, the error `ϵ`, and residual `r=z-Ax`. An iterative
 solution method then estimates the error `ϵ=̃A⁻¹r` and increments `x+=ϵ`, `r-=Aϵ`.
+
+On GPUs, a byte `reg[I]≠0` flags a regular cell, where `L=ℓ` on all faces (the fluid away from a body),
+and the stencils of these cells use `ℓ` instead of reading `L`, `D` and `iD`. `ℓ` is the largest `L`
+when the level is made.
 """
 struct Poisson{T,S<:AbstractArray{T},V<:AbstractArray{T}} <: AbstractPoisson{T,S,V}
     L :: V # Lower diagonal coefficients
     D :: S # Diagonal coefficients
     iD :: S # 1/Diagonal
+    reg :: S # regular-cell flags, one byte per cell packed in an array like x (set on GPUs only)
+    ℓ :: T # L on all faces of a regular cell
     x :: S # approximate solution
     ϵ :: S # increment/error
     r :: S # residual
@@ -33,8 +39,10 @@ struct Poisson{T,S<:AbstractArray{T},V<:AbstractArray{T}} <: AbstractPoisson{T,S
         @assert axes(x) == axes(z) && axes(x) == Base.front(axes(L)) && last(axes(L)) == eachindex(axes(x))
         r = similar(x); fill!(r,0)
         ϵ,D,iD = copy(r),copy(r),copy(r)
-        set_diag!(D,iD,L)
-        new{T,typeof(x),typeof(L)}(L,D,iD,x,ϵ,r,z,[],perdir)
+        reg = similar(x,(cld(size(x,1),sizeof(T)),Base.tail(size(x))...)); fill!(reg,0)
+        ℓ = isgpu(x) ? maximum(L) : one(T)
+        isgpu(x) ? set_diag!(D,iD,flags(reg),ℓ,L) : set_diag!(D,iD,L)
+        new{T,typeof(x),typeof(L)}(L,D,iD,reg,ℓ,x,ϵ,r,z,[],perdir)
     end
 end
 
@@ -44,7 +52,20 @@ function set_diag!(D,iD,L)
     @inside D[I] = diag(I,L)
     @inside iD[I] = iszero(D[I]) ? D[I] : inv(D[I])
 end
-update!(p::Poisson) = set_diag!(p.D,p.iD,p.L)
+set_diag!(D,iD,reg,ℓ,L) = @loop (D[I] = diag(I,L); iD[I] = iszero(D[I]) ? D[I] : inv(D[I]);
+                                 reg[I] = regular(I,L,ℓ)) over I ∈ inside(D)
+update!(p::Poisson) = isgpu(p.x) ? set_diag!(p.D,p.iD,flags(p.reg),p.ℓ,p.L) : set_diag!(p.D,p.iD,p.L) # reg is used on GPUs only
+flags(reg) = reinterpret(UInt8,reg)
+
+# the flag of cell `I`: whether `L=ℓ` on all its faces
+@inline function regular(I::CartesianIndex{d},L,ℓ) where {d}
+    b = true
+    for i in 1:d
+        b &= @inbounds(L[I,i]==ℓ && L[I+δ(i,I),i]==ℓ)
+    end
+    return UInt8(b)
+end
+regular(I::CartesianIndex,L::AbstractArray{<:Dual},ℓ) = 0x00 # equal values can have different partials
 
 @fastmath @inline function diag(I::CartesianIndex{d},L) where {d}
     s = zero(eltype(L))
@@ -66,7 +87,8 @@ function mult!(p::Poisson,x)
     @assert axes(p.z)==axes(x)
     perBC!(x,p.perdir)
     fill!(p.z,0)
-    @inside p.z[I] = mult(I,p.L,p.D,x)
+    reg = regs(p)
+    @inside p.z[I] = mult(I,p.L,p.D,reg,x)
     return p.z
 end
 """
@@ -84,6 +106,27 @@ end
 # `x[J]`, or the value `x(J,args...)` of a field that is evaluated on the fly
 @inline at(x::AbstractArray,J,args...) = @inbounds x[J]
 @inline at(x::Function,J,args...) = x(J,args...)
+
+# `ℓ` of a regular cell or 0. `reg=nothing` treats every cell as irregular
+@inline ℓof((f,ℓ)::Tuple,I) = ifelse(@inbounds(f[I])==0x00,zero(ℓ),ℓ)
+@inline ℓof(::Nothing,I) = false
+regs(p::Poisson) = isgpu(p.x) ? (flags(p.reg),p.ℓ) : nothing # the branch costs more than the memory traffic it saves on CPUs
+regs(p::AbstractPoisson) = nothing
+
+"""
+    mult(I,L,D,reg,x)
+
+`(Ax)[I]`, using `reg` to skip reading `L` and `D` in regular cells.
+"""
+@fastmath @inline function mult(I::CartesianIndex{d},L,D,reg::Union{Tuple,Nothing},x) where {d}
+    ℓ = ℓof(reg,I)
+    iszero(ℓ) && return mult(I,L,D,x)
+    s = -2d*@inbounds(x[I])
+    for i in 1:d
+        s += @inbounds(x[I-δ(i,I)]+x[I+δ(i,I)])
+    end
+    return ℓ*s
+end
 
 """
     residual!(p::Poisson,src=nothing)
@@ -104,7 +147,8 @@ residual kernel, and `p.z` is neither read nor written.
 """
 function residual!(p::Poisson,src=nothing)
     perBC!(p.x,p.perdir)
-    @inside p.r[I] = ifelse(p.iD[I]==0,zero(eltype(p.r)),source(I,p.z,p.D,src)-mult(I,p.L,p.D,p.x))
+    reg = regs(p)
+    @inside p.r[I] = ifelse(p.iD[I]==0,zero(eltype(p.r)),source(I,p.z,p.D,src)-mult(I,p.L,p.D,reg,p.x))
     s = meanr(p.r,p.iD) # only solved rows absorb the imbalance
     abs(s) <= 2eps(eltype(s)) && return
     @inside p.r[I] = ifelse(p.iD[I]==0,zero(eltype(p.r)),p.r[I]-s)
@@ -113,8 +157,8 @@ end
 @inline source(I,z,D,(u,V,idt)::Tuple) = idt*(div(I,u)-δv(D,I)*div(I,V))
 
 function increment!(p::Poisson{T};ω=1) where {T}
-    perBC!(p.ϵ,p.perdir)
-    @loop (p.r[I] = p.r[I]-ω*mult(I,p.L,p.D,p.ϵ);
+    perBC!(p.ϵ,p.perdir); reg = regs(p)
+    @loop (p.r[I] = p.r[I]-ω*mult(I,p.L,p.D,reg,p.ϵ);
            p.x[I] = p.x[I]+ω*p.ϵ[I]) over I ∈ inside(p.x)
 end
 
@@ -218,13 +262,29 @@ end
     end
     return s*@inbounds(iD[I])
 end
+@fastmath @inline function gauss(I::CartesianIndex{d},r,L,iD,reg::Union{Tuple,Nothing},x) where {d}
+    ℓ = ℓof(reg,I)
+    iszero(ℓ) && return gauss(I,r,L,iD,x)
+    s = @inbounds(r[I])
+    for i in 1:d
+        s -= ℓ*@inbounds(x[I-δ(i,I)]+x[I+δ(i,I)])
+    end
+    return s*inv(-2d*ℓ) # iD of a regular cell
+end
 
 # x[I] = gauss(I,…) on colour k₀; the neighbours are read from `y`, which is `x` unless
 # given as a function `y(J,args...)`
 @inline function gauss_rb(x,r,L,iD,k₀,Iv::CartesianIndex{d},y=x,args...) where {d}
+    I,ok = rb(x,k₀,Iv)
+    ok && (x[I] = gauss(I,r,L,iD,y,args...))
+end
+@inline function gauss_rb(x,r,L,iD,reg,k₀,Iv::CartesianIndex{d}) where {d}
+    I,ok = rb(x,k₀,Iv)
+    ok && (x[I] = gauss(I,r,L,iD,reg,x))
+end
+@inline function rb(x,k₀,Iv::CartesianIndex{d}) where {d}
     k = 2*Iv.I[end] - 1 - (sum(Base.front(Iv.I)) + k₀) % 2 # double the k-index and shift for red-black indexing
-    I = CartesianIndex(ntuple( i-> i==d ? k : Iv.I[i], d))
-    k < size(x,d) && (x[I] = gauss(I,r,L,iD,y,args...)) # with an odd size, the last k is a ghost for one colour
+    return CartesianIndex(ntuple( i-> i==d ? k : Iv.I[i], d)), k < size(x,d) # with an odd size, the last k is a ghost for one colour
 end
 
 @inline function half_rangek(x::AbstractArray{T,N}) where{T,N}
@@ -240,6 +300,7 @@ With `norms=true`, it returns `L₁∞(p)` of the new residual (see `increment_L
 Note: This performs best on GPU configurations and is the default smoother.
 """
 function GaussSeidelRB!(p::Poisson{T};it=4, ω=1, norms=false) where {T}
+    reg = regs(p)
     if isgpu(p.x) && isempty(p.perdir) && it ≥ 2
         # the first half sweep reads the initial ϵ=r⊙iD on the fly, and the second sets the rest of ϵ
         @loop gauss_rb(p.ϵ,p.r,p.L,p.iD,1,I,jacobi0,p.r,p.iD) over I ∈ half_rangek(p.ϵ)
@@ -249,7 +310,7 @@ function GaussSeidelRB!(p::Poisson{T};it=4, ω=1, norms=false) where {T}
         perBC!(p.ϵ,p.perdir); i₀ = 1
     end
     for i ∈ i₀:it
-        @loop gauss_rb(p.ϵ,p.r,p.L,p.iD,i,I) over I ∈ half_rangek(p.ϵ)
+        @loop gauss_rb(p.ϵ,p.r,p.L,p.iD,reg,i,I) over I ∈ half_rangek(p.ϵ)
     end
     norms && return increment_L₁∞!(p;ω)
     increment!(p;ω) # increment solution and residual
@@ -280,9 +341,10 @@ function pcg!(p::Poisson{T};it=6,kwargs...) where T
     @inside z[I] = ϵ[I] = r[I]*p.iD[I]
     rho = r⋅z
     abs(rho)<10eps(T) && return
+    reg = regs(p)
     for i in 1:it
         perBC!(ϵ,p.perdir)
-        @inside z[I] = mult(I,p.L,p.D,ϵ)
+        @inside z[I] = mult(I,p.L,p.D,reg,ϵ)
         alpha = rho/perdot(z,ϵ,p.perdir)
         (abs(alpha)<1e-2 || abs(alpha)>1e2) && return # alpha should be O(1)
         @loop (x[I] += alpha*ϵ[I];

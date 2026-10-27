@@ -249,10 +249,12 @@ function pressure!(a::AbstractFlow, b::Union{Poisson,MultiLevelPoisson}, dt; tol
         @inside b.z[I] = idt*(div(I,a.u)-δv(Dp,I)*div(I,a.V))
         solver!(b; tol, kwargs...)
     end
-    project!(a.u,b.L,b.x,dt)
+    project!(a.u,b.L,b.x,dt,regs(b))
 end
 # u -= s⋅L∇x
-project!(u,L,x,s=1) = @loop u[I,i] -= s*L[I,i]*∂(i,I,x) over I ∈ inside(x), i ∈ 1:ndims(x)
+project!(u,L,x,s=1,reg=nothing) = @loop u[I,i] -= s*Lface(reg,L,I,i)*∂(i,I,x) over I ∈ inside(x), i ∈ 1:ndims(x)
+# L[I,i], which is ℓ on the faces of the regular cells
+@inline Lface(reg,L,I,i) = (ℓ = ℓof(reg,I); iszero(ℓ) ? @inbounds(L[I,i]) : ℓ)
 
 function CFL(a::AbstractFlow;Δt_max=10)
     # on GPUs the maximum is reduced in the loop, with σ as the scratch array of the partials
