@@ -241,9 +241,14 @@ function pressure!(a::AbstractFlow, b::AbstractPoisson, dt; kwargs...)
     b.x ./= dt             # and unscale to recover pressure
 end
 function pressure!(a::AbstractFlow, b::Union{Poisson,MultiLevelPoisson}, dt; tol=default_tol, kwargs...)
-    idt = inv(dt); Dp = diagonal(b)
-    @inside b.z[I] = idt*(div(I,a.u)-δv(Dp,I)*div(I,a.V))
-    solver!(b; tol=tol/primal(dt), kwargs...) # the tolerance is a number, also when dt is a `Dual`
+    idt = inv(dt); tol = tol/primal(dt) # the tolerance is a number, also when dt is a `Dual`
+    if isgpu(b.x) # the residual evaluates the source, which saves a pass
+        solver!(b; tol, src=(a.u,a.V,idt), kwargs...)
+    else
+        Dp = diagonal(b)
+        @inside b.z[I] = idt*(div(I,a.u)-δv(Dp,I)*div(I,a.V))
+        solver!(b; tol, kwargs...)
+    end
     project!(a.u,b.L,b.x,dt)
 end
 # u -= s⋅L∇x
