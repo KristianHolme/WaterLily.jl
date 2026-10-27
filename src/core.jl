@@ -97,6 +97,7 @@ end
 
 """
     @loop <expr> over <I ∈ R>
+    @loop <expr> over <I ∈ R>, <i ∈ r>
 
 Macro to automate fast loops using @simd when running in serial,
 or KernelAbstractions when running multi-threaded CPU or GPU.
@@ -124,23 +125,35 @@ when multi-threading on CPU or using CuArrays.
 Note that `get_backend` is used on the _first_ variable in `expr` (`a` in this example).
 
 `R` is any array, such as a `CartesianIndices`, a [`face`](@ref) or a vector on the same device as `a`,
-and `I` takes its values.
+and `I` takes its values. With a second iterator, `@loop a[I,i] = b[I,i] over I ∈ R, i ∈ 1:n`,
+each work-item loops over `i ∈ r` for its `I`. This is the same as one loop over `CartesianIndices((R...,r))`,
+but a work-item loads the values shared by the components (such as a pressure stencil) once,
+and needs fewer index divisions.
 """
 macro loop(args...)
     ex,_,itr = args
+    inner = nothing
+    if Meta.isexpr(itr,:tuple) # over I ∈ R, i ∈ r
+        itr,inner = itr.args
+    end
     _,I,R = itr.args
     sym = []
     grab!(sym,ex)     # get arguments and replace composites in `ex`
     setdiff!(sym,[I]) # don't want to pass I as an argument
+    if !isnothing(inner)
+        _,i,r = inner.args
+        setdiff!(sym,[i]); grab!(sym,r) # pass the symbols of r, not i
+    end
     symT = [gensym() for _ in 1:length(sym)] # generate a list of types for each symbol
     symWtypes = joinsymtype(rep.(sym),symT) # symbols with types: [a::A, b::B, ...]
     @gensym(kern, kern_, R_, J_) # generate unique kernel function names for serial and KA execution, and the range and launch index
     @static if backend == "KernelAbstractions"
+        body = isnothing(inner) ? :(@fastmath @inbounds $ex) : :(for $i ∈ $r; @fastmath @inbounds $ex; end)
         return quote
             @kernel function $kern_($(symWtypes...),$R_) where {$(symT...)} # replace composite arguments
                 $J_ = @index(Global,Cartesian)
                 $I = @inbounds $R_[$J_] # the range gives the cell index
-                @fastmath @inbounds $ex
+                $body
             end
             function $kern($kern_,$(symWtypes...)) where {$(symT...)} # kernel passed as argument: capturing it would box it
                 $R_ = $R
@@ -149,13 +162,15 @@ macro loop(args...)
             $kern($kern_,$(sym...))
         end |> esc
     else # backend == "SIMD"
+        body = :(@inbounds @simd for $J_ ∈ CartesianIndices($R_) # @inbounds need for @simd vectorization, CartesianIndices for nested loops over any range
+                    $I = $R_[$J_]
+                    @fastmath @inbounds $ex
+                end)
+        isnothing(inner) || (body = :(for $i ∈ $r; $body; end))
         return quote
             function $kern($(symWtypes...)) where {$(symT...)}
                 $R_ = $R
-                @inbounds @simd for $J_ ∈ CartesianIndices($R_) # @inbounds need for @simd vectorization, CartesianIndices for nested loops over any range
-                    $I = $R_[$J_]
-                    @fastmath @inbounds $ex
-                end
+                $body
             end
             $kern($(sym...))
         end |> esc

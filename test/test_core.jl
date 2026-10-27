@@ -30,6 +30,10 @@
         end
         @test_throws ArgumentError WaterLily.face(CartesianIndices(dims),j) # not one cell thick in j
     end
+    comps(R,n,f) = (a = zeros(Float32,7,9,n) |> f; WaterLily.@loop a[X,k] += k*X[1] over X ∈ R, k ∈ 1:n; Array(a)) # a second iterator
+    for f ∈ arrays, R ∈ (CartesianIndices((2:6,3:9)),CartesianIndices((1:2:7,2:3)))
+        @test comps(R,2,f) == [i*I[1]*(I ∈ R) for I ∈ CartesianIndices((7,9)), i ∈ 1:2]
+    end
 
     for f ∈ arrays
         Ng, D, U = (6, 6), 2, (1.0, 0.5)
