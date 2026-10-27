@@ -21,6 +21,8 @@ end
         @test err < 5e-6          # looser solve at default tol=2e-3 than the old extensive default
         @test pois.n[] < 340
         @test WaterLily.L∞(pois) < 2e-3   # max-norm (L∞) tolerance is met
+        @test all(WaterLily.L₁∞(pois) .≈ (WaterLily.L₁(pois),WaterLily.L∞(pois)))
+        @test WaterLily.meanr(pois.r,pois.iD) ≈ sum(pois.r)/count(!iszero,pois.iD) atol=1e-6
         err,pois = Poisson_setup(Poisson,(2^4+2,2^4+2,2^4+2);f)
         @test err < 1e-6
         @test pois.n[] < 40
