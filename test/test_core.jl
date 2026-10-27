@@ -31,6 +31,19 @@
         @test_throws ArgumentError WaterLily.face(CartesianIndices(dims),j) # not one cell thick in j
     end
 
+    # @loop tiles: the divisions by FastDiv are exact, and the work-items cover every index of a range once
+    xs = UInt32[0:1000; 2^31-1000:2^31-1; rand(0:2^31-1,1000)]
+    @test all(div(x,WaterLily.FastDiv(d))==div(x,UInt32(d)) for d ∈ [1:1000; 2^16-2:2^16+2; 2^31-2:2^31; rand(1:2^31,100)], x ∈ xs)
+    @test_throws ArgumentError WaterLily.FastDiv(0)
+    for dims ∈ ((1,),(300,),(7,9),(65,3),(5,6,8),(130,17,3))
+        R = CartesianIndices(dims); t = WaterLily.tiles(R); seen = zeros(Int,dims)
+        for g ∈ 1:WaterLily.ngroups(t), l ∈ 1:WaterLily.loopgroup(R)
+            J,v = WaterLily.tileindex(R,t,g,l); v && (seen[J] += 1)
+        end
+        @test all(==(1),seen)
+    end
+    @test WaterLily.loopgroup(1:300)==WaterLily.LOOPTILE && WaterLily.loopgroup(CartesianIndices((7,9)))==WaterLily.LOOPGROUP
+
     for f ∈ arrays
         Ng, D, U = (6, 6), 2, (1.0, 0.5)
         u = rand(Ng..., D) |> f # vector

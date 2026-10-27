@@ -119,19 +119,14 @@ becomes
         @fastmath @inbounds a[I,i] += sum(loc(i,I))
     end
 
-on serial execution, or
-
-    @kernel function kern(a,i,R)
-        I = R[@index(Global,Cartesian)]
-        @fastmath @inbounds a[I,i] += sum(loc(i,I))
-    end
-    kern(get_backend(a),64)(a,i,R,ndrange=size(R))
-
-when multi-threading on CPU or using CuArrays.
-Note that `get_backend` is used on the _first_ variable in `expr` (`a` in this example).
+on serial execution, or a KernelAbstractions kernel with one work-item per `I ∈ R`
+when multi-threading on CPU or using CuArrays. Note that `get_backend` is used on the
+_first_ variable in `expr` (`a` in this example).
 
 `R` is any array, such as a `CartesianIndices`, a [`face`](@ref) or a vector on the same device as `a`,
 and `I` takes its values.
+
+The kernels launch work-groups of [`loopgroup`](@ref) work-items as tiles of `R`: see [`tiles`](@ref).
 """
 macro loop(args...)
     ex,_,itr = args
@@ -141,17 +136,20 @@ macro loop(args...)
     setdiff!(sym,[I]) # don't want to pass I as an argument
     symT = [gensym() for _ in 1:length(sym)] # generate a list of types for each symbol
     symWtypes = joinsymtype(rep.(sym),symT) # symbols with types: [a::A, b::B, ...]
-    @gensym(kern, kern_, R_, J_) # generate unique kernel function names for serial and KA execution, and the range and launch index
+    @gensym(kern, kern_, R_, J_, v_, t_) # generate unique kernel function names for serial and KA execution, and the range and launch index
     @static if backend == "KernelAbstractions"
         return quote
-            @kernel function $kern_($(symWtypes...),$R_) where {$(symT...)} # replace composite arguments
-                $J_ = @index(Global,Cartesian)
-                $I = @inbounds $R_[$J_] # the range gives the cell index
-                @fastmath @inbounds $ex
+            @kernel unsafe_indices=true function $kern_($(symWtypes...),$R_,$t_) where {$(symT...)} # replace composite arguments
+                $J_,$v_ = WaterLily.tileindex($R_,$t_,@index(Group,Linear),@index(Local,Linear))
+                if $v_ # the last tiles in each direction are partly outside R
+                    $I = @inbounds $R_[$J_] # the range gives the cell index
+                    @fastmath @inbounds $ex
+                end
             end
             function $kern($kern_,$(symWtypes...)) where {$(symT...)} # kernel passed as argument: capturing it would box it
-                $R_ = $R
-                $kern_(get_backend($(rep(sym[1]))),64)($(rep.(sym)...),$R_,ndrange=size($R_))
+                $R_ = $R; isempty($R_) && return
+                $t_ = WaterLily.tiles($R_)
+                $kern_(get_backend($(rep(sym[1]))),WaterLily.loopgroup($R_))($(rep.(sym)...),$R_,$t_,ndrange=WaterLily.loopgroup($R_)*WaterLily.ngroups($t_))
             end
             $kern($kern_,$(sym...))
         end |> esc
@@ -168,6 +166,97 @@ macro loop(args...)
         end |> esc
     end
 end
+
+"""
+    LOOPGROUP
+    LOOPTILE
+
+Work-items per work-group of an [`@loop`](@ref) kernel (see [`loopgroup`](@ref)), and the largest
+tile they cover in the first direction of a range. The rest of the work-group spans the next
+directions, so neighbouring work-items share the cache lines of a stencil in those directions.
+"""
+const LOOPGROUP = 256
+const LOOPTILE = 64
+
+"""
+    loopgroup(R)
+
+Work-items per work-group of an [`@loop`](@ref) kernel over `R`: [`LOOPGROUP`](@ref), or `LOOPTILE`
+for a vector `R`, which has no next directions. Vectors, such as lists of boundary cells, often have
+items of uneven cost, which smaller work-groups balance better over the multiprocessors.
+"""
+loopgroup(::AbstractArray{<:Any,N}) where N = N==1 ? LOOPTILE : LOOPGROUP
+
+"""
+    FastDiv(d)
+
+Divisor `d` with a precomputed multiplier, so that `div(x,::FastDiv)` is a multiplication and
+two shifts on GPUs, without branches, for `x < 2^31` (Granlund & Montgomery, 1994).
+"""
+struct FastDiv
+    d::UInt32; m::UInt32; l::UInt32
+end
+function FastDiv(d::Integer)
+    d ≥ 1 || throw(ArgumentError("FastDiv needs d ≥ 1"))
+    l = d==1 ? 0 : 32-leading_zeros(UInt32(d-1)) # ceil(log2(d))
+    FastDiv(UInt32(d), UInt32((UInt64(1)<<32)*((UInt64(1)<<l)-d)÷d+1), UInt32(l))
+end
+@inline Base.div(x::UInt32,f::FastDiv) = (t = ((UInt64(x)*f.m)>>32)%UInt32; (t+x)>>(f.l&0x1f))
+
+"""
+    Tiles
+
+Work-group decomposition of a range into tiles: the bits of the work-item index in each direction
+(tile sizes are powers of two) and the number of tiles in each direction, as [`FastDiv`](@ref)s
+so that a work-item finds its tile without divisions.
+"""
+struct Tiles{N}
+    b::NTuple{N,UInt32}
+    n::NTuple{N,FastDiv}
+end
+"""
+    tiles(R)
+
+The [`Tiles`](@ref) of range `R`: up to `LOOPTILE` along the first direction, and the rest of the
+[`loopgroup`](@ref) work-items along the next directions, each tile no larger than `R`.
+"""
+function tiles(R::AbstractArray{<:Any,N}) where N
+    b = _tilebits(size(R),trailing_zeros(loopgroup(R)),trailing_zeros(LOOPTILE))
+    Tiles{N}(b, map((n,bd) -> FastDiv(cld(n,1<<bd)), size(R), b))
+end
+# bits of the tile in each direction: at most `top`, the `left` bits of the work-group, and ⌈log₂ n⌉
+_tilebits(::Tuple{},left,top) = ()
+function _tilebits(n::Tuple,left,top)
+    m = min(left, top, 8sizeof(Int)-leading_zeros(first(n)-1))
+    (UInt32(m), _tilebits(Base.tail(n),left-m,left-m)...)
+end
+ngroups(t::Tiles) = prod(m -> Int(m.d), t.n)
+
+"""
+    tileindex(R,t::Tiles,g,l)
+
+Index `J` of work-item `l` of work-group `g`, such that it works on `R[J]`, and whether `J` is inside `R`.
+Work-items past the tile size of a small `R` are outside it.
+"""
+@inline function tileindex(R::AbstractArray{<:Any,N},t::Tiles{N},g,l) where N
+    l,g = (l-1)%UInt32,(g-1)%UInt32
+    lc,rest = _bits(l,t.b) # position in the tile
+    gc = _split(g,t.n)     # tile
+    o = ntuple(d -> gc[d]<<(t.b[d]&0x1f)+lc[d], Val(N))
+    J = CartesianIndex(ntuple(d -> o[d]%Int+1, Val(N)))
+    J, all(ntuple(d -> o[d] < size(R,d)%UInt32, Val(N))) & iszero(rest)
+end
+# split x into fields of b[d] bits, and the bits left
+@inline _bits(x,::Tuple{}) = ((),x)
+@inline function _bits(x,b::Tuple)
+    s = first(b)&0x1f
+    lc,rest = _bits(x>>s,Base.tail(b))
+    (x&(one(x)<<s-one(x)), lc...), rest
+end
+# 0-based mixed-radix digits of x, the last digit takes the remainder
+@inline _split(x,::Tuple{}) = ()
+@inline _split(x,::Tuple{Any}) = (x,)
+@inline _split(x,d::Tuple) = (q = Base.div(x,first(d)); (x-q*first(d).d, _split(q,Base.tail(d))...))
 function grab!(sym,ex::Expr)
     ex.head == :. && return union!(sym,[ex])      # grab composite name and return
     start = ex.head==:(call) ? 2 : 1              # don't grab function names
@@ -216,8 +305,7 @@ insert(J::CartesianIndex{M},i,j) where M = CI(ntuple(k -> k<j ? J[k] : k==j ? i 
     face(dims,i,j,low=1) = face(slice(dims,i,j,low),j)
 
 The cells of a range `R` one cell thick in dimension `j` (such as a `slice`), as a `MappedArr` over its
-other dimensions. `@loop` launches over those, so the 64-thread workgroups lie along the face, also when
-it is normal to `j=1`.
+other dimensions. `@loop` tiles those, so the work-groups lie along the face, also when it is normal to `j=1`.
 """
 face(R::CartesianIndices{N},j) where N = (i=only(R.indices[j]); MappedArr(J->insert(J,i,j),CartesianIndices(ntuple(k -> R.indices[k<j ? k : k+1], N-1))))
 face(dims::NTuple,i,j,low=1) = face(slice(dims,i,j,low),j)
