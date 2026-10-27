@@ -89,23 +89,23 @@ function Vcycle!(ml::MultiLevelPoisson;l=1,ω=1,fix=nothing)
     fine,coarse = ml.levels[l],ml.levels[l+1]
     c = coarsen_mask(fine.x,coarse.x)
     isgpu(fine.x) || return Vcycle_cpu!(ml,fine,coarse,c;l,ω)
-    r,ϵ,x,L,D,iD,cr,cx = fine.r,fine.ϵ,fine.x,fine.L,fine.D,fine.iD,coarse.r,coarse.x
+    r,ϵ,x,L,D,iD,reg,cr,cx = fine.r,fine.ϵ,fine.x,fine.L,fine.D,fine.iD,regs(fine),coarse.r,coarse.x
     N,per = size(x),perarg(x,fine.perdir)
     # set up coarse level: Jacobi! with ϵ=r⊙iD evaluated on the fly, and its residual stored in ϵ. With `fix=s`,
     # the residual is first corrected to `iD==0 ? 0 : r-s` (as in `residual!`) and its norms are returned
     norms = if isnothing(fix)
-        @loop (ϵ[I] = r[I]-mult(I,L,D,jacobi,r,iD,N,per);
+        @loop (ϵ[I] = r[I]-mult(I,L,D,reg,jacobi,r,iD,N,per);
                x[I] += jacobi(I,r,iD,N,per)) over I ∈ inside(x)
         nothing
     else
-        loop_reduce(_jacobi_fix,(+,max),inside(x),fine.z,ϵ,r,x,L,D,iD,fix,N,per)
+        loop_reduce(_jacobi_fix,(+,max),inside(x),fine.z,ϵ,r,x,L,D,iD,reg,fix,N,per)
     end
     @loop (cr[I] = restrict(I,ϵ,c); cx[I] = zero(eltype(cx))) over I ∈ inside(cx)
     # solve coarse (with recursion if possible)
     l+1<length(ml.levels) && Vcycle!(ml,l=l+1; ω)
     smooth!(coarse;ω)
     # correct fine: increment! with ϵ=prolongate!(coarse.x) evaluated on the fly, from the residual in ϵ
-    @loop (r[I] = ϵ[I]-ω*mult(I,L,D,prolong,cx,c,N,per);
+    @loop (r[I] = ϵ[I]-ω*mult(I,L,D,reg,prolong,cx,c,N,per);
            x[I] += ω*prolong(I,cx,c,N,per)) over I ∈ inside(x)
     return norms
 end
@@ -127,9 +127,9 @@ end
 @inline prolong(J,cx,c,N,per) = @inbounds cx[down(wrap(J,N,per),c)]
 # `jacobi` of the corrected residual, which is zero where iD==0
 @inline jacobi_fix(J,r,iD,s,N,per) = (J = wrap(J,N,per); @inbounds (r[J]-s)*iD[J])
-@fastmath @inline function _jacobi_fix(I,ϵ,r,x,L,D,iD,s,N,per)
+@fastmath @inline function _jacobi_fix(I,ϵ,r,x,L,D,iD,reg,s,N,per)
     v = iszero(@inbounds iD[I]) ? zero(s) : @inbounds(r[I])-s
-    @inbounds ϵ[I] = v-mult(I,L,D,jacobi_fix,r,iD,s,N,per)
+    @inbounds ϵ[I] = v-mult(I,L,D,reg,jacobi_fix,r,iD,s,N,per)
     @inbounds x[I] += v*iD[I]
     return abs(v),abs(v)
 end

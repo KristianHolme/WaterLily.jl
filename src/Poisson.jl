@@ -114,16 +114,17 @@ regs(p::Poisson) = isgpu(p.x) ? (flags(p.reg),p.ℓ) : nothing # the branch cost
 regs(p::AbstractPoisson) = nothing
 
 """
-    mult(I,L,D,reg,x)
+    mult(I,L,D,reg,x,args...)
 
-`(Ax)[I]`, using `reg` to skip reading `L` and `D` in regular cells.
+`(Ax)[I]`, using `reg` to skip reading `L` and `D` in regular cells. `x` is an array, or a function
+`x(J,args...)` evaluated on the fly.
 """
-@fastmath @inline function mult(I::CartesianIndex{d},L,D,reg::Union{Tuple,Nothing},x) where {d}
+@fastmath @inline function mult(I::CartesianIndex{d},L,D,reg::Union{Tuple,Nothing},x,args...) where {d}
     ℓ = ℓof(reg,I)
-    iszero(ℓ) && return mult(I,L,D,x)
-    s = -2d*@inbounds(x[I])
+    iszero(ℓ) && return mult(I,L,D,x,args...)
+    s = -2d*at(x,I,args...)
     for i in 1:d
-        s += @inbounds(x[I-δ(i,I)]+x[I+δ(i,I)])
+        s += at(x,I-δ(i,I),args...)+at(x,I+δ(i,I),args...)
     end
     return ℓ*s
 end
@@ -204,10 +205,10 @@ with `p.z` as the scratch array.
 function increment_L₁∞!(p::Poisson{T};ω=1) where {T}
     isgpu(p.x) || (increment!(p;ω); return L₁∞(p))
     perBC!(p.ϵ,p.perdir)
-    loop_reduce(_increment,(+,max),inside(p.x),p.z,p.r,p.x,p.ϵ,p.L,p.D,T(ω))
+    loop_reduce(_increment,(+,max),inside(p.x),p.z,p.r,p.x,p.ϵ,p.L,p.D,regs(p),T(ω))
 end
-@fastmath @inline function _increment(I,r,x,ϵ,L,D,ω)
-    @inbounds v = r[I]-ω*mult(I,L,D,ϵ); @inbounds r[I] = v
+@fastmath @inline function _increment(I,r,x,ϵ,L,D,reg,ω)
+    @inbounds v = r[I]-ω*mult(I,L,D,reg,ϵ); @inbounds r[I] = v
     @inbounds x[I] += ω*ϵ[I]
     return abs(v),abs(v)
 end
@@ -229,13 +230,13 @@ end
 # correction subtracts from it (zero when negligible)
 function residual_mean!(p::Poisson{T},src=nothing) where {T}
     perBC!(p.x,p.perdir)
-    Σr,n = loop_reduce(_residual,(+,+),inside(p.x),p.ϵ,p.r,p.x,p.z,p.L,p.D,p.iD,src)
+    Σr,n = loop_reduce(_residual,(+,+),inside(p.x),p.ϵ,p.r,p.x,p.z,p.L,p.D,p.iD,regs(p),src)
     s = Σr/n # only solved rows absorb the imbalance
     return abs(s) <= 2eps(T) ? zero(T) : s
 end
-@fastmath @inline function _residual(I,r,x,z,L,D,iD,src)
+@fastmath @inline function _residual(I,r,x,z,L,D,iD,reg,src)
     solved = !iszero(@inbounds iD[I])
-    v = solved ? source(I,z,D,src)-mult(I,L,D,x) : zero(eltype(r))
+    v = solved ? source(I,z,D,src)-mult(I,L,D,reg,x) : zero(eltype(r))
     @inbounds r[I] = v
     return v,eltype(r)(solved)
 end
@@ -262,25 +263,25 @@ end
     end
     return s*@inbounds(iD[I])
 end
-@fastmath @inline function gauss(I::CartesianIndex{d},r,L,iD,reg::Union{Tuple,Nothing},x) where {d}
+@fastmath @inline function gauss(I::CartesianIndex{d},r,L,iD,reg::Union{Tuple,Nothing},x,args...) where {d}
     ℓ = ℓof(reg,I)
-    iszero(ℓ) && return gauss(I,r,L,iD,x)
+    iszero(ℓ) && return gauss(I,r,L,iD,x,args...)
     s = @inbounds(r[I])
     for i in 1:d
-        s -= ℓ*@inbounds(x[I-δ(i,I)]+x[I+δ(i,I)])
+        s -= ℓ*(at(x,I-δ(i,I),args...)+at(x,I+δ(i,I),args...))
     end
     return s*inv(-2d*ℓ) # iD of a regular cell
 end
 
 # x[I] = gauss(I,…) on colour k₀; the neighbours are read from `y`, which is `x` unless
 # given as a function `y(J,args...)`
-@inline function gauss_rb(x,r,L,iD,k₀,Iv::CartesianIndex{d},y=x,args...) where {d}
+@inline function gauss_rb(x,r,L,iD,k₀,Iv::CartesianIndex{d}) where {d}
     I,ok = rb(x,k₀,Iv)
-    ok && (x[I] = gauss(I,r,L,iD,y,args...))
+    ok && (x[I] = gauss(I,r,L,iD,x))
 end
-@inline function gauss_rb(x,r,L,iD,reg,k₀,Iv::CartesianIndex{d}) where {d}
+@inline function gauss_rb(x,r,L,iD,reg,k₀,Iv::CartesianIndex{d},y=x,args...) where {d}
     I,ok = rb(x,k₀,Iv)
-    ok && (x[I] = gauss(I,r,L,iD,reg,x))
+    ok && (x[I] = gauss(I,r,L,iD,reg,y,args...))
 end
 @inline function rb(x,k₀,Iv::CartesianIndex{d}) where {d}
     k = 2*Iv.I[end] - 1 - (sum(Base.front(Iv.I)) + k₀) % 2 # double the k-index and shift for red-black indexing
@@ -303,7 +304,7 @@ function GaussSeidelRB!(p::Poisson{T};it=4, ω=1, norms=false) where {T}
     reg = regs(p)
     if isgpu(p.x) && isempty(p.perdir) && it ≥ 2
         # the first half sweep reads the initial ϵ=r⊙iD on the fly, and the second sets the rest of ϵ
-        @loop gauss_rb(p.ϵ,p.r,p.L,p.iD,1,I,jacobi0,p.r,p.iD) over I ∈ half_rangek(p.ϵ)
+        @loop gauss_rb(p.ϵ,p.r,p.L,p.iD,reg,1,I,jacobi0,p.r,p.iD) over I ∈ half_rangek(p.ϵ)
         i₀ = 2
     else
         @inside p.ϵ[I] = p.r[I]*p.iD[I]  # initialize ϵ
