@@ -94,7 +94,7 @@ without the corrections, no solution exists.
 function residual!(p::Poisson)
     perBC!(p.x,p.perdir)
     @inside p.r[I] = ifelse(p.iD[I]==0,zero(eltype(p.r)),p.z[I]-mult(I,p.L,p.D,p.x))
-    s = sum(p.r)/count(!iszero,p.iD) # only solved rows absorb the imbalance
+    s = meanr(p.r,p.iD) # only solved rows absorb the imbalance
     abs(s) <= 2eps(eltype(s)) && return
     @inside p.r[I] = ifelse(p.iD[I]==0,zero(eltype(p.r)),p.r[I]-s)
 end
@@ -201,6 +201,21 @@ L₂(::GPU,a,R) = mapreduce(abs2,+,view(a,R.indices...))
 L₂(p::Poisson) = p.r ⋅ p.r # special method since outside(p.r)≡0
 L₁(p::Poisson) = sum(abs,p.r) # special method since outside(p.r)≡0
 L∞(p::Poisson) = maximum(abs,p.r)
+"""
+    L₁∞(p::Poisson)
+
+`(L₁(p),L∞(p))`, in a single reduction on GPUs.
+"""
+L₁∞(p::Poisson) = L₁∞(get_backend(p.r),p.r)
+L₁∞(::Backend,r) = (sum(abs,r),maximum(abs,r))
+L₁∞(::GPU,r) = mapreduce(a->(abs(a),abs(a)),((s,m),(t,n))->(s+t,max(m,n)),r;init=(zero(eltype(r)),zero(eltype(r))))
+# mean of `r` over the solved cells (`iD≠0`), in a single reduction on GPUs
+meanr(r,iD) = meanr(get_backend(r),r,iD)
+meanr(::Backend,r,iD) = sum(r)/count(!iszero,iD)
+function meanr(::GPU,r,iD)
+    s,n = mapreduce((a,d)->(a,Int32(!iszero(d))),((s,n),(t,m))->(s+t,n+m),r,iD;init=(zero(eltype(r)),Int32(0)))
+    return s/n
+end
 
 # mean residual  Σ|r|/N < tol/10   ⟺   L₁(p)=Σ|r| < (tol/10)·N
 l1n_tol(p::AbstractPoisson, tol) = (Float64(tol)/10) * length(inside(p.r))
@@ -223,10 +238,10 @@ Approximate iterative solver for the Poisson matrix equation `Ax=b`.
 """
 function solver!(p::Poisson;tol=2e-3,itmx=1e3)
     r₁tol = l1n_tol(p, tol); r∞tol = tol
-    residual!(p); r₁ = L₁(p); r∞ = L∞(p)
+    residual!(p); r₁,r∞ = L₁∞(p)
     nᵖ=0; @log ", $nᵖ, $r∞, $r₁\n"
     while nᵖ<itmx
-        pcg!(p); r₁ = L₁(p); r∞ = L∞(p); nᵖ+=1
+        pcg!(p); r₁,r∞ = L₁∞(p); nᵖ+=1
         @log ", $nᵖ, $r∞, $r₁\n"
         (r₁<r₁tol && r∞<r∞tol) && break
     end
