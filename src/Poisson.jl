@@ -156,6 +156,9 @@ function residual!(p::Poisson,src=nothing)
 end
 @inline source(I,z,D,::Nothing) = @inbounds z[I]
 @inline source(I,z,D,(u,V,idt)::Tuple) = idt*(div(I,u)-δv(D,I)*div(I,V))
+# in a regular cell with ℓ=1 (the fluid away from a body) δv(D)=1-ℓ vanishes: neither D nor V is read
+@inline source(I,z,D,src,ℓ) = source(I,z,D,src)
+@inline source(I,z,D,(u,V,idt)::Tuple,ℓ) = isone(ℓ) ? idt*div(I,u) : source(I,z,D,(u,V,idt))
 
 function increment!(p::Poisson{T};ω=1) where {T}
     perBC!(p.ϵ,p.perdir); reg = regs(p)
@@ -235,8 +238,9 @@ function residual_mean!(p::Poisson{T},src=nothing) where {T}
     return abs(s) <= 2eps(T) ? zero(T) : s
 end
 @fastmath @inline function _residual(I,r,x,z,L,D,iD,reg,src)
-    solved = !iszero(@inbounds iD[I])
-    v = solved ? source(I,z,D,src)-mult(I,L,D,reg,x) : zero(eltype(r))
+    ℓ = ℓof(reg,I) # a regular cell is solved: iD is not read
+    solved = !iszero(ℓ) || !iszero(@inbounds iD[I])
+    v = solved ? source(I,z,D,src,ℓ)-mult(I,L,D,reg,x) : zero(eltype(r))
     @inbounds r[I] = v
     return v,eltype(r)(solved)
 end
