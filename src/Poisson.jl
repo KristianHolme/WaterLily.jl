@@ -68,13 +68,22 @@ function mult!(p::Poisson,x)
     @inside p.z[I] = mult(I,p.L,p.D,x)
     return p.z
 end
-@fastmath @inline function mult(I::CartesianIndex{d},L,D,x) where {d}
-    s = zero(eltype(L))
+"""
+    mult(I,L,D,x,args...)
+
+`(Ax)[I] = Σ L·(x_nb − x[I])`, which maps a constant `x` exactly to zero. `x` is an array, or a
+function `x(J,args...)` evaluated on the fly.
+"""
+@fastmath @inline function mult(I::CartesianIndex{d},L,D,x,args...) where {d}
+    s = zero(eltype(L)); xI = at(x,I,args...)
     for i in 1:d
-        s += @inbounds(L[I,i]*(x[I-δ(i,I)]-x[I])+L[I+δ(i,I),i]*(x[I+δ(i,I)]-x[I]))
+        s += @inbounds(L[I,i])*(at(x,I-δ(i,I),args...)-xI)+@inbounds(L[I+δ(i,I),i])*(at(x,I+δ(i,I),args...)-xI)
     end
     return s
 end
+# `x[J]`, or the value `x(J,args...)` of a field that is evaluated on the fly
+@inline at(x::AbstractArray,J,args...) = @inbounds x[J]
+@inline at(x::Function,J,args...) = x(J,args...)
 
 """
     residual!(p::Poisson)
@@ -114,18 +123,20 @@ Note: This runs for general backends but converges _very_ slowly.
     increment!(p;ω)
 end
 
-@fastmath @inline function gauss(I::CartesianIndex{d},r,L,iD,x) where {d}
+@fastmath @inline function gauss(I::CartesianIndex{d},r,L,iD,x,args...) where {d}
     s = @inbounds(r[I])
     for i in 1:d
-        s -= @inbounds(x[I-δ(i,I)]*L[I,i] + x[I+δ(i,I)]*L[I+δ(i,I),i])
+        s -= at(x,I-δ(i,I),args...)*@inbounds(L[I,i]) + at(x,I+δ(i,I),args...)*@inbounds(L[I+δ(i,I),i])
     end
     return s*@inbounds(iD[I])
 end
 
-@inline function gauss_rb(x,r,L,iD,k₀,Iv::CartesianIndex{d}) where {d}
+# x[I] = gauss(I,…) on colour k₀; the neighbours are read from `y`, which is `x` unless
+# given as a function `y(J,args...)`
+@inline function gauss_rb(x,r,L,iD,k₀,Iv::CartesianIndex{d},y=x,args...) where {d}
     k = 2*Iv.I[end] - 1 - (sum(Base.front(Iv.I)) + k₀) % 2 # double the k-index and shift for red-black indexing
     I = CartesianIndex(ntuple( i-> i==d ? k : Iv.I[i], d))
-    k < size(x,d) && (x[I] = gauss(I,r,L,iD,x)) # with an odd size, the last k is a ghost for one colour
+    k < size(x,d) && (x[I] = gauss(I,r,L,iD,y,args...)) # with an odd size, the last k is a ghost for one colour
 end
 
 @inline function half_rangek(x::AbstractArray{T,N}) where{T,N}
@@ -140,13 +151,20 @@ Red-black Gauss-Seidel smoother. Runs `it` iterations; a complete red-black cycl
 Note: This performs best on GPU configurations and is the default smoother.
 """
 function GaussSeidelRB!(p::Poisson{T};it=4, ω=1) where {T}
-    @inside p.ϵ[I] = p.r[I]*p.iD[I]  # initialize ϵ
-    perBC!(p.ϵ,p.perdir)
-    for i ∈ 1:it
+    if isgpu(p.x) && isempty(p.perdir) && it ≥ 2
+        # the first half sweep reads the initial ϵ=r⊙iD on the fly, and the second sets the rest of ϵ
+        @loop gauss_rb(p.ϵ,p.r,p.L,p.iD,1,I,jacobi0,p.r,p.iD) over I ∈ half_rangek(p.ϵ)
+        i₀ = 2
+    else
+        @inside p.ϵ[I] = p.r[I]*p.iD[I]  # initialize ϵ
+        perBC!(p.ϵ,p.perdir); i₀ = 1
+    end
+    for i ∈ i₀:it
         @loop gauss_rb(p.ϵ,p.r,p.L,p.iD,i,I) over I ∈ half_rangek(p.ϵ)
     end
     increment!(p;ω) # increment solution and residual
 end
+@inline jacobi0(J,r,iD) = @inbounds r[J]*iD[J]
 
 using LinearAlgebra: ⋅
 import AcceleratedKernels as AK
