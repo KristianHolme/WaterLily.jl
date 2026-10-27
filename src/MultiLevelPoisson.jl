@@ -85,15 +85,21 @@ function update!(ml::MultiLevelPoisson)
     end
 end
 
-function Vcycle!(ml::MultiLevelPoisson;l=1,ω=1)
+function Vcycle!(ml::MultiLevelPoisson;l=1,ω=1,fix=nothing)
     fine,coarse = ml.levels[l],ml.levels[l+1]
     c = coarsen_mask(fine.x,coarse.x)
     isgpu(fine.x) || return Vcycle_cpu!(ml,fine,coarse,c;l,ω)
     r,ϵ,x,L,D,iD,cr,cx = fine.r,fine.ϵ,fine.x,fine.L,fine.D,fine.iD,coarse.r,coarse.x
     N,per = size(x),perarg(x,fine.perdir)
-    # set up coarse level: Jacobi! with ϵ=r⊙iD evaluated on the fly, and its residual stored in ϵ
-    @loop (ϵ[I] = r[I]-mult(I,L,D,jacobi,r,iD,N,per);
-           x[I] += jacobi(I,r,iD,N,per)) over I ∈ inside(x)
+    # set up coarse level: Jacobi! with ϵ=r⊙iD evaluated on the fly, and its residual stored in ϵ. With `fix=s`,
+    # the residual is first corrected to `iD==0 ? 0 : r-s` (as in `residual!`) and its norms are returned
+    norms = if isnothing(fix)
+        @loop (ϵ[I] = r[I]-mult(I,L,D,jacobi,r,iD,N,per);
+               x[I] += jacobi(I,r,iD,N,per)) over I ∈ inside(x)
+        nothing
+    else
+        loop_reduce(_jacobi_fix,(+,max),inside(x),fine.z,ϵ,r,x,L,D,iD,fix,N,per)
+    end
     @loop (cr[I] = restrict(I,ϵ,c); cx[I] = zero(eltype(cx))) over I ∈ inside(cx)
     # solve coarse (with recursion if possible)
     l+1<length(ml.levels) && Vcycle!(ml,l=l+1; ω)
@@ -101,6 +107,7 @@ function Vcycle!(ml::MultiLevelPoisson;l=1,ω=1)
     # correct fine: increment! with ϵ=prolongate!(coarse.x) evaluated on the fly, from the residual in ϵ
     @loop (r[I] = ϵ[I]-ω*mult(I,L,D,prolong,cx,c,N,per);
            x[I] += ω*prolong(I,cx,c,N,per)) over I ∈ inside(x)
+    return norms
 end
 # The V-cycle with stored increments: on CPUs, evaluating them on the fly costs more than the passes it saves
 function Vcycle_cpu!(ml,fine,coarse,c;l,ω)
@@ -118,6 +125,14 @@ end
 # Jacobi! and prolongate! increments at J, including the periodic copies in the ghosts that perBC! would fill
 @inline jacobi(J,r,iD,N,per) = (J = wrap(J,N,per); @inbounds r[J]*iD[J])
 @inline prolong(J,cx,c,N,per) = @inbounds cx[down(wrap(J,N,per),c)]
+# `jacobi` of the corrected residual, which is zero where iD==0
+@inline jacobi_fix(J,r,iD,s,N,per) = (J = wrap(J,N,per); @inbounds (r[J]-s)*iD[J])
+@fastmath @inline function _jacobi_fix(I,ϵ,r,x,L,D,iD,s,N,per)
+    v = iszero(@inbounds iD[I]) ? zero(s) : @inbounds(r[I])-s
+    @inbounds ϵ[I] = v-mult(I,L,D,jacobi_fix,r,iD,s,N,per)
+    @inbounds x[I] += v*iD[I]
+    return abs(v),abs(v)
+end
 
 mult!(ml::MultiLevelPoisson,x) = mult!(ml.levels[1],x)
 residual!(ml::MultiLevelPoisson,x) = residual!(ml.levels[1],x)
@@ -128,10 +143,21 @@ const smooth! = GaussSeidelRB!
 function solver!(ml::MultiLevelPoisson{T};tol=default_tol,itmx=32,src=nothing) where T
     p = ml.levels[1]
     r₁tol = l1n_tol(p, tol); r∞tol = tol
-    r₁,r∞ = residual_L₁∞!(p,src); ω = T(1)
-    nᵖ=0; @log ", $nᵖ, $r∞, $r₁, $ω\n"
+    # on GPUs with the source evaluated on the fly, the first fine Jacobi of the first V-cycle
+    # corrects the residual and returns its norms
+    fix = isgpu(p.x) && src isa Tuple && itmx ≥ 1 ? residual_mean!(p,src) : nothing
+    ω = T(1); nᵖ=0
+    if isnothing(fix)
+        r₁,r∞ = residual_L₁∞!(p,src)
+        @log ", $nᵖ, $r∞, $r₁, $ω\n"
+    end
     while nᵖ<itmx
-        Vcycle!(ml; ω)
+        if nᵖ==0 && !isnothing(fix)
+            r₁,r∞ = Vcycle!(ml; ω, fix)
+            @log ", $nᵖ, $r∞, $r₁, $ω\n"
+        else
+            Vcycle!(ml; ω)
+        end
         rnew,r∞ = smooth!(p; ω, norms=true); nᵖ+=1
         @log ", $nᵖ, $r∞, $rnew, $ω\n"
         if     rnew ≥ r₁
