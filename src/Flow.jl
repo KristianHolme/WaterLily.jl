@@ -287,7 +287,7 @@ apply BDIM and blend with the trapezoidal weight.
 function mom_correct!(a::AbstractFlow, t; udf=nothing, kwargs...)
     if fused(a,udf) # the fluxes read a.u, so it is overwritten after the update
         BDIM!(a,a.f,a.u,t,2)
-        return @loop a.u[Ii] = a.f[Ii] over Ii ∈ inside_u(size(a.p))
+        return @loop a.u[I,i] = a.f[I,i] over I ∈ inside(a.p), i ∈ 1:ndims(a.p)
     end
     conv_diff!(a.f,a.u,a.σ,a.λ;ν=a.ν,perdir=a.perdir)
     udf!(a,udf,a.u,t; kwargs...) # advect with projected a.u
