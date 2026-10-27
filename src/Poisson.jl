@@ -209,6 +209,9 @@ L₁L∞(p::Poisson) = L₁L∞(get_backend(p.r),p.r)
 L₁L∞(::CPU,r) = (sum(abs,r),maximum(abs,r))
 L₁L∞(::Backend,r) = AK.mapreduce(x->(abs(x),abs(x)),(a,b)->(a[1]+b[1],max(a[2],b[2])),r;init=(zero(eltype(r)),zero(eltype(r))))
 
+# default tolerance of `solver!`
+const default_tol = 2e-3
+
 # mean residual  Σ|r|/N < tol/10   ⟺   L₁(p)=Σ|r| < (tol/10)·N
 l1n_tol(p::AbstractPoisson, tol) = (Float64(tol)/10) * length(inside(p.r))
 
@@ -228,7 +231,7 @@ Approximate iterative solver for the Poisson matrix equation `Ax=b`.
         max-norm, no hidden exponents: the bulk sits 10× below the cap).
   - `itmx`: Maximum number of iterations.
 """
-function solver!(p::Poisson;tol=2e-3,itmx=1e3)
+function solver!(p::Poisson;tol=default_tol,itmx=1e3)
     r₁tol = l1n_tol(p, tol); r∞tol = tol
     residual!(p); r₁, r∞ = L₁L∞(p)
     nᵖ=0; @log ", $nᵖ, $r∞, $r₁\n"
