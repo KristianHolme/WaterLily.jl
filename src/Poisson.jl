@@ -109,6 +109,83 @@ function increment!(p::Poisson{T};ω=1) where {T}
     @loop (p.r[I] = p.r[I]-ω*mult(I,p.L,p.D,p.ϵ);
            p.x[I] = p.x[I]+ω*p.ϵ[I]) over I ∈ inside(p.x)
 end
+
+using KernelAbstractions: @localmem, @synchronize
+"""
+    loop_reduce(f,(op₁,op₂),R,buf,args...)
+
+GPU loop over `I ∈ R` that runs `f(I,args...)` and reduces the pair of values it returns with
+`op₁` and `op₂`, the starting values being zero. Each work-group reduces its pairs in shared
+memory and writes them to the scratch array `buf`, which `f` must not use; the partials are then
+reduced in one small `mapreduce`.
+"""
+function loop_reduce(f::F,(op₁,op₂),R,buf,args...) where F
+    T = eltype(buf); ng = cld(length(R),REDUCEGROUP)
+    @assert 2ng ≤ length(buf) "loop_reduce: the scratch array is too small for the partials"
+    s,m = view(vec(buf),1:ng),view(vec(buf),ng+1:2ng)
+    _loop_reduce!(get_backend(buf),REDUCEGROUP)(f,op₁,op₂,s,m,R,args;ndrange=ng*REDUCEGROUP)
+    return mapreduce((a,b)->(a,b),((a,b),(c,d))->(op₁(a,c),op₂(b,d)),s,m;init=(zero(T),zero(T)))
+end
+const REDUCEGROUP = 256 # work-items per work-group of loop_reduce
+@kernel function _loop_reduce!(f,op₁,op₂,s,m,R,args)
+    i = @index(Global,Linear); t = @index(Local,Linear); g = @index(Group,Linear)
+    a = @localmem eltype(s) (REDUCEGROUP,); b = @localmem eltype(s) (REDUCEGROUP,)
+    v₁ = v₂ = zero(eltype(s))
+    i ≤ length(R) && ((v₁,v₂) = f(@inbounds(R[i]),args...))
+    @inbounds a[t] = v₁; @inbounds b[t] = v₂
+    @synchronize
+    k = REDUCEGROUP÷2
+    while k ≥ 1
+        t ≤ k && (@inbounds a[t] = op₁(a[t],a[t+k]); @inbounds b[t] = op₂(b[t],b[t+k]))
+        @synchronize
+        k ÷= 2
+    end
+    t == 1 && (@inbounds s[g] = a[1]; @inbounds m[g] = b[1])
+end
+
+"""
+    increment_L₁∞!(p::Poisson;ω=1)
+
+`increment!(p;ω)` followed by `L₁∞(p)`. On GPUs, the norms are reduced in the increment kernel,
+with `p.z` as the scratch array.
+"""
+function increment_L₁∞!(p::Poisson{T};ω=1) where {T}
+    isgpu(p.x) || (increment!(p;ω); return L₁∞(p))
+    perBC!(p.ϵ,p.perdir)
+    loop_reduce(_increment,(+,max),inside(p.x),p.z,p.r,p.x,p.ϵ,p.L,p.D,T(ω))
+end
+@fastmath @inline function _increment(I,r,x,ϵ,L,D,ω)
+    @inbounds v = r[I]-ω*mult(I,L,D,ϵ); @inbounds r[I] = v
+    @inbounds x[I] += ω*ϵ[I]
+    return abs(v),abs(v)
+end
+
+"""
+    residual_L₁∞!(p::Poisson,src=nothing)
+
+`residual!(p,src)` followed by `L₁∞(p)`. On GPUs, the residual kernel also sums `r` and counts
+the solved cells, and the kernel that subtracts the mean also reduces the norms, with `p.ϵ` as
+the scratch array.
+"""
+function residual_L₁∞!(p::Poisson{T},src=nothing) where {T}
+    isgpu(p.x) || (residual!(p,src); return L₁∞(p))
+    perBC!(p.x,p.perdir)
+    Σr,n = loop_reduce(_residual,(+,+),inside(p.x),p.ϵ,p.r,p.x,p.z,p.L,p.D,p.iD,src)
+    s = Σr/n # only solved rows absorb the imbalance
+    abs(s) <= 2eps(T) && return L₁∞(p)
+    loop_reduce(_fix_residual,(+,max),inside(p.x),p.ϵ,p.r,p.iD,s)
+end
+@fastmath @inline function _residual(I,r,x,z,L,D,iD,src)
+    solved = !iszero(@inbounds iD[I])
+    v = solved ? source(I,z,D,src)-mult(I,L,D,x) : zero(eltype(r))
+    @inbounds r[I] = v
+    return v,eltype(r)(solved)
+end
+@inline function _fix_residual(I,r,iD,s)
+    v = iszero(@inbounds iD[I]) ? zero(eltype(r)) : @inbounds(r[I])-s
+    @inbounds r[I] = v
+    return abs(v),abs(v)
+end
 """
     Jacobi!(p::Poisson; it=1)
 
@@ -139,18 +216,20 @@ end
 end
 
 """
-    GaussSeidelRB!(p::Poisson;it=4, ω=1)
+    GaussSeidelRB!(p::Poisson;it=4, ω=1, norms=false)
 
 Red-black Gauss-Seidel smoother. Runs `it` iterations; a complete red-black cycle requires `it` to be even.
 `ω` under-/over-relaxes the solution through scaling the deferred corrections in `increment!`.
+With `norms=true`, it returns `L₁∞(p)` of the new residual (see `increment_L₁∞!`).
 Note: This performs best on GPU configurations and is the default smoother.
 """
-function GaussSeidelRB!(p::Poisson{T};it=4, ω=1) where {T}
+function GaussSeidelRB!(p::Poisson{T};it=4, ω=1, norms=false) where {T}
     @inside p.ϵ[I] = p.r[I]*p.iD[I]  # initialize ϵ
     perBC!(p.ϵ,p.perdir)
     for i ∈ 1:it
         @loop gauss_rb(p.ϵ,p.r,p.L,p.iD,i,I) over I ∈ half_rangek(p.ϵ)
     end
+    norms && return increment_L₁∞!(p;ω)
     increment!(p;ω) # increment solution and residual
 end
 
@@ -247,7 +326,7 @@ Approximate iterative solver for the Poisson matrix equation `Ax=b`.
 """
 function solver!(p::Poisson;tol=default_tol,itmx=1e3,src=nothing)
     r₁tol = l1n_tol(p, tol); r∞tol = tol
-    residual!(p,src); r₁,r∞ = L₁∞(p)
+    r₁,r∞ = residual_L₁∞!(p,src)
     nᵖ=0; @log ", $nᵖ, $r∞, $r₁\n"
     while nᵖ<itmx
         pcg!(p); r₁,r∞ = L₁∞(p); nᵖ+=1
