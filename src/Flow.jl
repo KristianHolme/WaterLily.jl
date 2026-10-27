@@ -225,12 +225,16 @@ function mom_project!(a::AbstractFlow, b::AbstractPoisson, w::Int, t; kwargs...)
     Dp = diagonal(b)                                # Poisson matrix diagonal
     @inside b.z[I] = div(I,a.u)-δv(Dp,I)*div(I,a.V) # flow divergence, not BDIM-ϵ stretching
     solver!(b; kwargs...)
+    reg = regs(b)
     for i ∈ 1:ndims(a.p)  # apply solution and unscale to recover pressure
-        @loop a.u[I,i] -= b.L[I,i]*∂(i,I,b.x) over I ∈ inside(b.x)
+        @loop a.u[I,i] -= Lface(reg,b.L,I,i)*∂(i,I,b.x) over I ∈ inside(b.x)
     end
     b.x ./= dt
     BC!(a.u,a.uBC,a.exitBC,a.perdir,t)
 end
+
+# L[I,i], which is ℓ on the faces of the regular cells
+@inline Lface(reg,L,I,i) = (ℓ = ℓof(reg,I); iszero(ℓ) ? @inbounds(L[I,i]) : ℓ)
 
 function CFL(a::AbstractFlow;Δt_max=10)
     fill!(a.σ,0) # the ghosts hold scratch values (such as the fluxes of conv_diff!)
