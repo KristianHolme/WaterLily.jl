@@ -259,8 +259,8 @@ time(a::AbstractFlow) = sum(@view(a.Δt[1:end-1]))
 
 function BDIM!(a::AbstractFlow,s=1)
     dt = a.Δt[end]
-    @loop a.f[I,i] = a.u⁰[I,i]+dt*a.f[I,i]-a.V[I,i] over I ∈ CartesianIndices(a.p), i ∈ 1:ndims(a.p)
-    @loop a.u[I,i] = (a.u[I,i]+(μddn(CI(I,i),a.μ₁,a.f)+a.V[I,i]+a.μ₀[I,i]*a.f[I,i]))/s over I ∈ inside(a.p), i ∈ 1:ndims(a.p)
+    @loop a.f[Ii] = a.u⁰[Ii]+dt*a.f[Ii]-a.V[Ii] over Ii in CartesianIndices(a.f)
+    @loop a.u[Ii] = (a.u[Ii]+(μddn(Ii,a.μ₁,a.f)+a.V[Ii]+a.μ₀[Ii]*a.f[Ii]))/s over Ii ∈ inside_u(size(a.p))
 end
 
 """
