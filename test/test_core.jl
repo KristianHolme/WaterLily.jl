@@ -37,6 +37,12 @@
         @test_throws ArgumentError WaterLily.face(CartesianIndices(dims),j) # not one cell thick in j
     end
 
+    # GPU workgroup shapes of @loop: powers of two along the range, 256 work-items unless the range is smaller
+    @test WaterLily.tile((130,17,3),256,64) == (64,4,1)
+    @test WaterLily.tile((5,6,8),256,64) == (8,8,4)
+    @test WaterLily.tile((4,4,128),256,64) == (4,4,16)
+    @test WaterLily.tile((258,258,258,3),256,64) == (64,4,1,1)
+
     for f ∈ arrays
         Ng, D, U = (6, 6), 2, (1.0, 0.5)
         u = rand(Ng..., D) |> f # vector

@@ -105,6 +105,24 @@ workgroup(::Backend) = (64,)
 @static pkgversion(KernelAbstractions) >= v"0.10" && (workgroup(::CPU) = ())
 
 """
+    workgroup(backend, R)
+
+Workgroup shape of the `@loop` kernels over the range `R` on GPUs: 256 work-items, up to 64 along
+the first direction of `R` and the rest along the next directions, so that neighbouring work-items
+share the cache lines of a stencil. KA launches a kernel with an N-d workgroup on an N-d grid,
+which gives each work-item its index without divisions. A vector `R` gets 64 work-items.
+"""
+workgroup(::Backend, R::AbstractArray{<:Any,N}) where N = N==1 ? (64,) : tile(size(R),256,64)
+# powers of two: at most `top` and the next power of two of the size, `left` work-items in all
+tile(::Tuple{},left,top) = ()
+tile(n::Tuple,left,top) = (m = min(left,top,nextpow(2,first(n))); (m, tile(Base.tail(n),left÷m,left÷m)...))
+
+# launch `kern` over `R`: the CPU backend shapes its own workgroups, GPUs take `workgroup(B,R)`
+# (type parameters make Julia specialize on `kern` and `args`, which it only passes on)
+@inline launch!(B::CPU,kern::K,R,args::Vararg{Any,N}) where {K,N} = kern(B,workgroup(B)...)(args...,R,ndrange=size(R))
+@inline launch!(B::Backend,kern::K,R,args::Vararg{Any,N}) where {K,N} = kern(B)(args...,R,ndrange=size(R),workgroupsize=workgroup(B,R))
+
+"""
     zeros_on(b,T,dims), ones_on(b,T,dims)
 
 Arrays of zeros or ones of type `T` and size `dims` on the KA backend `b`, filled by KA with the
@@ -138,7 +156,8 @@ on serial execution, or
     end
     kern(get_backend(a),workgroup(get_backend(a))...)(a,i,R,ndrange=size(R))
 
-when multi-threading on CPU or using CuArrays, with the workgroup size of [`workgroup`](@ref).
+when multi-threading on CPU, with the workgroup size of [`workgroup`](@ref). On GPUs the kernel is
+launched with the workgroup shape of `workgroup(backend,R)` instead.
 Note that `get_backend` is used on the _first_ variable in `expr` (`a` in this example).
 
 `R` is any array, such as a `CartesianIndices`, a [`face`](@ref) or a vector on the same device as `a`,
@@ -162,7 +181,7 @@ macro loop(args...)
             end
             function $kern($kern_,$(symWtypes...)) where {$(symT...)} # kernel passed as argument: capturing it would box it
                 $R_ = $R; $B_ = get_backend($(rep(sym[1])))
-                $kern_($B_,$workgroup($B_)...)($(rep.(sym)...),$R_,ndrange=size($R_))
+                $launch!($B_,$kern_,$R_,$(rep.(sym)...))
             end
             $kern($kern_,$(sym...))
         end |> esc
@@ -227,8 +246,8 @@ insert(J::CartesianIndex{M},i,j) where M = CI(ntuple(k -> k<j ? J[k] : k==j ? i 
     face(dims,i,j,low=1) = face(slice(dims,i,j,low),j)
 
 The cells of a range `R` one cell thick in dimension `j` (such as a `slice`), as a `MappedArr` over its
-other dimensions. `@loop` launches over those, so the 64-thread workgroups lie along the face, also when
-it is normal to `j=1`.
+other dimensions. `@loop` launches over those, so the workgroups lie along the face, also when it is
+normal to `j=1`.
 """
 face(R::CartesianIndices{N},j) where N = (i=only(R.indices[j]); MappedArr(J->insert(J,i,j),CartesianIndices(ntuple(k -> R.indices[k<j ? k : k+1], N-1))))
 face(dims::NTuple,i,j,low=1) = face(slice(dims,i,j,low),j)
