@@ -109,8 +109,9 @@ workgroup(::Backend) = (64,)
 
 Workgroup shape of the `@loop` kernels over the range `R` on GPUs: 256 work-items, up to 64 along
 the first direction of `R` and the rest along the next directions, so that neighbouring work-items
-share the cache lines of a stencil. KA launches a kernel with an N-d workgroup on an N-d grid,
-which gives each work-item its index without divisions. A vector `R` gets 64 work-items.
+share the cache lines of a stencil. KA 0.10 launches a kernel with an N-d workgroup on an N-d grid,
+which gives each work-item its index without divisions. A vector `R` gets 64 work-items. With KA 0.9
+the GPUs keep `workgroup(backend)`.
 """
 workgroup(::Backend, R::AbstractArray{<:Any,N}) where N = N==1 ? (64,) : tile(size(R),256,64)
 # powers of two: at most `top` and the next power of two of the size, `left` work-items in all
@@ -120,7 +121,12 @@ tile(n::Tuple,left,top) = (m = min(left,top,nextpow(2,first(n))); (m, tile(Base.
 # launch `kern` over `R`: the CPU backend shapes its own workgroups, GPUs take `workgroup(B,R)`
 # (type parameters make Julia specialize on `kern` and `args`, which it only passes on)
 @inline launch!(B::CPU,kern::K,R,args::Vararg{Any,N}) where {K,N} = kern(B,workgroup(B)...)(args...,R,ndrange=size(R))
-@inline launch!(B::Backend,kern::K,R,args::Vararg{Any,N}) where {K,N} = kern(B)(args...,R,ndrange=size(R),workgroupsize=workgroup(B,R))
+@inline function launch!(B::Backend,kern::K,R,args::Vararg{Any,N}) where {K,N}
+    @static if pkgversion(KernelAbstractions) < v"0.10" # no N-d grid launch: the index divisions cost more than the shape gains
+        return kern(B,workgroup(B)...)(args...,R,ndrange=size(R))
+    end
+    kern(B)(args...,R,ndrange=size(R),workgroupsize=workgroup(B,R))
+end
 
 """
     zeros_on(b,T,dims), ones_on(b,T,dims)
